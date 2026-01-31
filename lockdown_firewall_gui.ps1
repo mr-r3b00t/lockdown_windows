@@ -1356,12 +1356,77 @@ $browseBackupsButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $browseBackupsButton.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
 $browseBackupsButton.FlatStyle = "Flat"
 $toolTip = New-Object System.Windows.Forms.ToolTip
-$toolTip.SetToolTip($browseBackupsButton, "Open backups folder")
+$toolTip.SetToolTip($browseBackupsButton, "Select backup file to restore")
 $browseBackupsButton.Add_Click({
+    # Ensure backup folder exists
     if (-not (Test-Path $script:BackupFolder)) {
         New-Item -Path $script:BackupFolder -ItemType Directory -Force | Out-Null
     }
-    Start-Process explorer.exe -ArgumentList $script:BackupFolder
+    
+    $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+    $openFileDialog.Title = "Select Backup File to Restore"
+    $openFileDialog.InitialDirectory = $script:BackupFolder
+    $openFileDialog.Filter = "JSON Backup Files (*.json)|*.json|All Files (*.*)|*.*"
+    $openFileDialog.FilterIndex = 1
+    
+    if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $selectedFile = $openFileDialog.FileName
+        
+        # Validate the selected file
+        try {
+            $backup = Get-Content $selectedFile -Raw | ConvertFrom-Json
+            $backupTime = $backup.Timestamp
+            $backupComputer = $backup.ComputerName
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Invalid backup file. Could not read configuration data.`n`nError: $_",
+                "Invalid File",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            return
+        }
+        
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Restore from selected backup?`n`nFile: $(Split-Path $selectedFile -Leaf)`nBackup created: $backupTime`nComputer: $backupComputer`n`nThis will undo hardening changes. Continue?",
+            "Confirm Rollback",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $hardenButton.Enabled = $false
+            $refreshButton.Enabled = $false
+            $selectAllButton.Enabled = $false
+            $deselectAllButton.Enabled = $false
+            $rollbackButton.Enabled = $false
+            $browseBackupsButton.Enabled = $false
+            
+            $logTextBox.Clear()
+            $success = Restore-Configuration -LogBox $logTextBox -BackupPath $selectedFile
+            
+            Start-Sleep -Seconds 1
+            Update-AllStatus
+            $hasBackup = Update-BackupStatus
+            $rollbackButton.Enabled = $isAdmin -and $hasBackup
+            
+            $hardenButton.Enabled = $true
+            $refreshButton.Enabled = $true
+            $selectAllButton.Enabled = $true
+            $deselectAllButton.Enabled = $true
+            $browseBackupsButton.Enabled = $true
+            
+            if ($success) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Rollback complete!`n`nA system reboot is recommended for all changes to take full effect.",
+                    "Rollback Complete",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                )
+            }
+        }
+    }
 })
 $buttonPanel.Controls.Add($browseBackupsButton)
 
@@ -1397,7 +1462,7 @@ $form.Add_Shown({
         $logTextBox.Text = "WARNING: Not running as Administrator.`r`nPlease restart this script with elevated privileges to enable hardening.`r`n`r`nRight-click PowerShell > Run as Administrator"
     }
     else {
-        $logTextBox.Text = "Ready. Select components to harden and click 'Harden System'.`r`n`r`nCurrent status shown above. Green = Secure, Red = Vulnerable.`r`n`r`nTip: Uncheck components you want to exclude from hardening.`r`nTip: Check 'Preserve RDP rules' if you need remote desktop access.`r`n`r`nBackups are saved to: $script:BackupFolder`r`nUse 'Rollback' to restore previous settings after hardening."
+        $logTextBox.Text = "Ready. Select components to harden and click 'Harden System'.`r`n`r`nCurrent status shown above. Green = Secure, Red = Vulnerable.`r`n`r`nTip: Uncheck components you want to exclude from hardening.`r`nTip: Check 'Preserve RDP rules' if you need remote desktop access.`r`nTip: NTLM is unchecked by default - enabling may break legacy apps.`r`n`r`nBackups are saved to: $script:BackupFolder`r`nUse 'Rollback' to restore from last backup, or '...' to select a specific backup file."
     }
 })
 
