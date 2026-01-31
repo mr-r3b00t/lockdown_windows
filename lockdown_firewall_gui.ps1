@@ -397,14 +397,20 @@ function Get-FirewallStatus {
 function Get-InboundRulesStatus {
     try {
         $rules = Get-NetFirewallRule -Direction Inbound -PolicyStore PersistentStore -ErrorAction Stop
-        $enabledRules = ($rules | Where-Object { $_.Enabled -eq "True" }).Count
+        # Only count Allow rules as potentially vulnerable - Block rules are security measures
+        $enabledAllowRules = ($rules | Where-Object { $_.Enabled -eq "True" -and $_.Action -eq "Allow" }).Count
+        $enabledBlockRules = ($rules | Where-Object { $_.Enabled -eq "True" -and $_.Action -eq "Block" }).Count
         $totalRules = $rules.Count
         
-        if ($enabledRules -eq 0) {
-            return @{ Status = "Secure"; Color = "Green"; Detail = "All $totalRules rules disabled" }
+        if ($enabledAllowRules -eq 0) {
+            $detail = "All allow rules disabled"
+            if ($enabledBlockRules -gt 0) {
+                $detail += " ($enabledBlockRules block rules active)"
+            }
+            return @{ Status = "Secure"; Color = "Green"; Detail = $detail }
         }
         else {
-            return @{ Status = "Vulnerable"; Color = "Red"; Detail = "$enabledRules of $totalRules rules enabled" }
+            return @{ Status = "Vulnerable"; Color = "Red"; Detail = "$enabledAllowRules allow rules enabled" }
         }
     }
     catch {
