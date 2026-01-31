@@ -41,6 +41,7 @@ function Get-CurrentConfiguration {
         WPAD = @{}
         MDNS = @{}
         LLMNR = @{}
+        NTLM = @{}
     }
     
     # Firewall Profiles
@@ -143,6 +144,21 @@ function Get-CurrentConfiguration {
     }
     catch {
         $config.LLMNR.Error = $_.Exception.Message
+    }
+    
+    # NTLM settings
+    try {
+        $lmCompat = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -ErrorAction SilentlyContinue
+        $config.NTLM.LmCompatibilityLevel = if ($lmCompat) { $lmCompat.LmCompatibilityLevel } else { $null }
+        
+        $restrictSend = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Name "RestrictSendingNTLMTraffic" -ErrorAction SilentlyContinue
+        $config.NTLM.RestrictSendingNTLMTraffic = if ($restrictSend) { $restrictSend.RestrictSendingNTLMTraffic } else { $null }
+        
+        $restrictReceive = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Name "RestrictReceivingNTLMTraffic" -ErrorAction SilentlyContinue
+        $config.NTLM.RestrictReceivingNTLMTraffic = if ($restrictReceive) { $restrictReceive.RestrictReceivingNTLMTraffic } else { $null }
+    }
+    catch {
+        $config.NTLM.Error = $_.Exception.Message
     }
     
     return $config
@@ -337,7 +353,7 @@ function Restore-Configuration {
     }
     
     # Restore LLMNR
-    Write-Log "`r`n[6/6] Restoring LLMNR settings..."
+    Write-Log "`r`n[6/7] Restoring LLMNR settings..."
     try {
         $dnsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
         
@@ -356,6 +372,43 @@ function Restore-Configuration {
             Remove-NetFirewallRule -DisplayName "Block LLMNR (UDP 5355)" -ErrorAction SilentlyContinue
             Remove-NetFirewallRule -DisplayName "Block LLMNR Outbound (UDP 5355)" -ErrorAction SilentlyContinue
             Write-Log "  OK: LLMNR block rules removed"
+        }
+    }
+    catch {
+        Write-Log "  ERROR: $_"
+    }
+    
+    # Restore NTLM
+    Write-Log "`r`n[7/7] Restoring NTLM settings..."
+    try {
+        $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+        $msv1Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+        
+        if ($null -ne $config.NTLM.LmCompatibilityLevel) {
+            Set-ItemProperty -Path $lsaPath -Name "LmCompatibilityLevel" -Value $config.NTLM.LmCompatibilityLevel -Type DWord
+            Write-Log "  OK: LmCompatibilityLevel restored to $($config.NTLM.LmCompatibilityLevel)"
+        }
+        elseif ($config.NTLM.LmCompatibilityLevel -eq $null) {
+            Remove-ItemProperty -Path $lsaPath -Name "LmCompatibilityLevel" -ErrorAction SilentlyContinue
+            Write-Log "  OK: LmCompatibilityLevel registry key removed"
+        }
+        
+        if ($null -ne $config.NTLM.RestrictSendingNTLMTraffic) {
+            Set-ItemProperty -Path $msv1Path -Name "RestrictSendingNTLMTraffic" -Value $config.NTLM.RestrictSendingNTLMTraffic -Type DWord
+            Write-Log "  OK: RestrictSendingNTLMTraffic restored to $($config.NTLM.RestrictSendingNTLMTraffic)"
+        }
+        elseif ($config.NTLM.RestrictSendingNTLMTraffic -eq $null) {
+            Remove-ItemProperty -Path $msv1Path -Name "RestrictSendingNTLMTraffic" -ErrorAction SilentlyContinue
+            Write-Log "  OK: RestrictSendingNTLMTraffic registry key removed"
+        }
+        
+        if ($null -ne $config.NTLM.RestrictReceivingNTLMTraffic) {
+            Set-ItemProperty -Path $msv1Path -Name "RestrictReceivingNTLMTraffic" -Value $config.NTLM.RestrictReceivingNTLMTraffic -Type DWord
+            Write-Log "  OK: RestrictReceivingNTLMTraffic restored to $($config.NTLM.RestrictReceivingNTLMTraffic)"
+        }
+        elseif ($config.NTLM.RestrictReceivingNTLMTraffic -eq $null) {
+            Remove-ItemProperty -Path $msv1Path -Name "RestrictReceivingNTLMTraffic" -ErrorAction SilentlyContinue
+            Write-Log "  OK: RestrictReceivingNTLMTraffic registry key removed"
         }
     }
     catch {
@@ -531,6 +584,45 @@ function Get-LLMNRStatus {
         
         if (-not $vulnerable) {
             return @{ Status = "Secure"; Color = "Green"; Detail = "LLMNR disabled and blocked" }
+        }
+        else {
+            return @{ Status = "Vulnerable"; Color = "Red"; Detail = ($details -join ", ") }
+        }
+    }
+    catch {
+        return @{ Status = "Unknown"; Color = "Gray"; Detail = "Could not query" }
+    }
+}
+
+function Get-NTLMStatus {
+    try {
+        $vulnerable = $false
+        $details = @()
+        
+        # Check LmCompatibilityLevel (5 = NTLMv2 only, refuse LM & NTLM)
+        $lmCompat = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -ErrorAction SilentlyContinue
+        if (-not $lmCompat -or $lmCompat.LmCompatibilityLevel -lt 5) {
+            $vulnerable = $true
+            $level = if ($lmCompat) { $lmCompat.LmCompatibilityLevel } else { "default" }
+            $details += "LM level: $level"
+        }
+        
+        # Check if NTLM is restricted for outgoing traffic
+        $restrictSend = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Name "RestrictSendingNTLMTraffic" -ErrorAction SilentlyContinue
+        if (-not $restrictSend -or $restrictSend.RestrictSendingNTLMTraffic -lt 2) {
+            $vulnerable = $true
+            $details += "Outbound NTLM allowed"
+        }
+        
+        # Check if NTLM is restricted for incoming traffic
+        $restrictReceive = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Name "RestrictReceivingNTLMTraffic" -ErrorAction SilentlyContinue
+        if (-not $restrictReceive -or $restrictReceive.RestrictReceivingNTLMTraffic -lt 2) {
+            $vulnerable = $true
+            $details += "Inbound NTLM allowed"
+        }
+        
+        if (-not $vulnerable) {
+            return @{ Status = "Secure"; Color = "Green"; Detail = "NTLM restricted (NTLMv2 only)" }
         }
         else {
             return @{ Status = "Vulnerable"; Color = "Red"; Detail = ($details -join ", ") }
@@ -774,6 +866,39 @@ function Invoke-Hardening {
         Write-Log "`r`n[SKIPPED] LLMNR (unchecked)"
     }
     
+    # 7. Disable NTLM
+    if ($Options.NTLM) {
+        $stepNum++
+        Write-Log "`r`n[$stepNum/$totalSteps] Restricting NTLM authentication..."
+        try {
+            $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+            $msv1Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+            
+            # Set LmCompatibilityLevel to 5 (Send NTLMv2 response only, refuse LM & NTLM)
+            Set-ItemProperty -Path $lsaPath -Name "LmCompatibilityLevel" -Value 5 -Type DWord
+            Write-Log "  OK: LmCompatibilityLevel set to 5 (NTLMv2 only)"
+            
+            # Ensure MSV1_0 path exists
+            if (-not (Test-Path $msv1Path)) { New-Item -Path $msv1Path -Force | Out-Null }
+            
+            # Restrict sending NTLM traffic (2 = Deny all)
+            Set-ItemProperty -Path $msv1Path -Name "RestrictSendingNTLMTraffic" -Value 2 -Type DWord
+            Write-Log "  OK: Outbound NTLM traffic restricted"
+            
+            # Restrict receiving NTLM traffic (2 = Deny all)
+            Set-ItemProperty -Path $msv1Path -Name "RestrictReceivingNTLMTraffic" -Value 2 -Type DWord
+            Write-Log "  OK: Inbound NTLM traffic restricted"
+            
+            Write-Log "  WARNING: NTLM restriction may break legacy apps/services"
+        }
+        catch {
+            Write-Log "  ERROR: $_"
+        }
+    }
+    else {
+        Write-Log "`r`n[SKIPPED] NTLM (unchecked)"
+    }
+    
     Write-Log "`r`n========================================"
     Write-Log "Hardening complete!"
     Write-Log "A reboot is recommended for full effect."
@@ -786,7 +911,7 @@ function Invoke-Hardening {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Windows Network Hardening Tool"
-$form.Size = New-Object System.Drawing.Size(750, 780)
+$form.Size = New-Object System.Drawing.Size(750, 810)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedSingle"
 $form.MaximizeBox = $false
@@ -848,7 +973,7 @@ function Update-BackupStatus {
 $statusGroup = New-Object System.Windows.Forms.GroupBox
 $statusGroup.Text = "Current Security Status"
 $statusGroup.Location = New-Object System.Drawing.Point(20, 80)
-$statusGroup.Size = New-Object System.Drawing.Size(695, 280)
+$statusGroup.Size = New-Object System.Drawing.Size(695, 310)
 $statusGroup.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($statusGroup)
 
@@ -888,7 +1013,7 @@ $statusGroup.Controls.Add($headerDetail)
 # Status Panel
 $statusPanel = New-Object System.Windows.Forms.Panel
 $statusPanel.Location = New-Object System.Drawing.Point(10, 45)
-$statusPanel.Size = New-Object System.Drawing.Size(675, 225)
+$statusPanel.Size = New-Object System.Drawing.Size(675, 255)
 $statusPanel.AutoScroll = $false
 $statusGroup.Controls.Add($statusPanel)
 
@@ -899,7 +1024,8 @@ $statusItems = @(
     @{ Name = "NetBIOS over TCP/IP"; Key = "NetBIOS" },
     @{ Name = "WPAD (Web Proxy Auto-Discovery)"; Key = "WPAD" },
     @{ Name = "mDNS (Multicast DNS)"; Key = "MDNS" },
-    @{ Name = "LLMNR (Link-Local Multicast Name Resolution)"; Key = "LLMNR" }
+    @{ Name = "LLMNR (Link-Local Multicast Name Resolution)"; Key = "LLMNR" },
+    @{ Name = "NTLM Authentication"; Key = "NTLM" }
 )
 
 $script:statusLabels = @{}
@@ -911,7 +1037,8 @@ foreach ($item in $statusItems) {
     $checkBox = New-Object System.Windows.Forms.CheckBox
     $checkBox.Location = New-Object System.Drawing.Point(15, ($yPos + 2))
     $checkBox.Size = New-Object System.Drawing.Size(20, 20)
-    $checkBox.Checked = $true
+    # NTLM is unchecked by default due to compatibility concerns
+    $checkBox.Checked = ($item.Key -ne "NTLM")
     $checkBox.Tag = $item.Key
     $statusPanel.Controls.Add($checkBox)
     $script:checkBoxes[$item.Key] = $checkBox
@@ -971,6 +1098,7 @@ function Update-AllStatus {
         "WPAD" = { Get-WPADStatus }
         "MDNS" = { Get-MDNSStatus }
         "LLMNR" = { Get-LLMNRStatus }
+        "NTLM" = { Get-NTLMStatus }
     }
     
     foreach ($key in $checks.Keys) {
@@ -990,7 +1118,7 @@ function Update-AllStatus {
 
 # Buttons Panel
 $buttonPanel = New-Object System.Windows.Forms.Panel
-$buttonPanel.Location = New-Object System.Drawing.Point(20, 370)
+$buttonPanel.Location = New-Object System.Drawing.Point(20, 400)
 $buttonPanel.Size = New-Object System.Drawing.Size(695, 50)
 $form.Controls.Add($buttonPanel)
 
@@ -1101,6 +1229,7 @@ $hardenButton.Add_Click({
             WPAD = $script:checkBoxes["WPAD"].Checked
             MDNS = $script:checkBoxes["MDNS"].Checked
             LLMNR = $script:checkBoxes["LLMNR"].Checked
+            NTLM = $script:checkBoxes["NTLM"].Checked
             PreserveRDP = $script:rdpCheckBox.Checked
         }
         
@@ -1239,7 +1368,7 @@ $buttonPanel.Controls.Add($browseBackupsButton)
 # Log Group Box
 $logGroup = New-Object System.Windows.Forms.GroupBox
 $logGroup.Text = "Activity Log"
-$logGroup.Location = New-Object System.Drawing.Point(20, 425)
+$logGroup.Location = New-Object System.Drawing.Point(20, 455)
 $logGroup.Size = New-Object System.Drawing.Size(695, 300)
 $logGroup.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($logGroup)
