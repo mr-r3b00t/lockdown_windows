@@ -798,11 +798,11 @@ $form.Controls.Add($titleLabel)
 # Admin Status
 $adminLabel = New-Object System.Windows.Forms.Label
 if ($isAdmin) {
-    $adminLabel.Text = "✓ Running as Administrator"
+    $adminLabel.Text = "[OK] Running as Administrator"
     $adminLabel.ForeColor = [System.Drawing.Color]::Green
 }
 else {
-    $adminLabel.Text = "✗ Not running as Administrator (hardening will fail)"
+    $adminLabel.Text = "[X] Not running as Administrator (hardening will fail)"
     $adminLabel.ForeColor = [System.Drawing.Color]::Red
 }
 $adminLabel.Location = New-Object System.Drawing.Point(20, 50)
@@ -990,7 +990,7 @@ $form.Controls.Add($buttonPanel)
 
 # Select All Button
 $selectAllButton = New-Object System.Windows.Forms.Button
-$selectAllButton.Text = "☑ All"
+$selectAllButton.Text = "[+] All"
 $selectAllButton.Location = New-Object System.Drawing.Point(0, 5)
 $selectAllButton.Size = New-Object System.Drawing.Size(70, 35)
 $selectAllButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -1005,7 +1005,7 @@ $buttonPanel.Controls.Add($selectAllButton)
 
 # Deselect All Button
 $deselectAllButton = New-Object System.Windows.Forms.Button
-$deselectAllButton.Text = "☐ None"
+$deselectAllButton.Text = "[-] None"
 $deselectAllButton.Location = New-Object System.Drawing.Point(80, 5)
 $deselectAllButton.Size = New-Object System.Drawing.Size(70, 35)
 $deselectAllButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -1020,7 +1020,7 @@ $buttonPanel.Controls.Add($deselectAllButton)
 
 # Refresh Button
 $refreshButton = New-Object System.Windows.Forms.Button
-$refreshButton.Text = "🔄 Refresh"
+$refreshButton.Text = "Refresh"
 $refreshButton.Location = New-Object System.Drawing.Point(165, 5)
 $refreshButton.Size = New-Object System.Drawing.Size(90, 35)
 $refreshButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -1031,14 +1031,14 @@ $refreshButton.Add_Click({
     $refreshButton.Text = "..."
     Update-AllStatus
     Update-BackupStatus
-    $refreshButton.Text = "🔄 Refresh"
+    $refreshButton.Text = "Refresh"
     $refreshButton.Enabled = $true
 })
 $buttonPanel.Controls.Add($refreshButton)
 
 # Harden Button
 $hardenButton = New-Object System.Windows.Forms.Button
-$hardenButton.Text = "🛡️ Harden System"
+$hardenButton.Text = "Harden System"
 $hardenButton.Location = New-Object System.Drawing.Point(270, 5)
 $hardenButton.Size = New-Object System.Drawing.Size(140, 35)
 $hardenButton.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
@@ -1066,7 +1066,7 @@ $hardenButton.Add_Click({
     
     $confirmMsg = "This will apply hardening to the following components:`n`n"
     foreach ($key in $selectedItems) {
-        $confirmMsg += "• $key`n"
+        $confirmMsg += "* $key`n"
     }
     if ($script:rdpCheckBox.Checked -and $script:checkBoxes["InboundRules"].Checked) {
         $confirmMsg += "`n(RDP rules will be preserved)`n"
@@ -1105,7 +1105,7 @@ $hardenButton.Add_Click({
         $hasBackup = Update-BackupStatus
         $rollbackButton.Enabled = $isAdmin -and $hasBackup
         
-        $hardenButton.Text = "🛡️ Harden System"
+        $hardenButton.Text = "Harden System"
         $hardenButton.Enabled = $true
         $refreshButton.Enabled = $true
         $selectAllButton.Enabled = $true
@@ -1123,7 +1123,7 @@ $buttonPanel.Controls.Add($hardenButton)
 
 # Rollback Button
 $rollbackButton = New-Object System.Windows.Forms.Button
-$rollbackButton.Text = "⏪ Rollback"
+$rollbackButton.Text = "<< Rollback"
 $rollbackButton.Location = New-Object System.Drawing.Point(420, 5)
 $rollbackButton.Size = New-Object System.Drawing.Size(110, 35)
 $rollbackButton.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -1177,7 +1177,7 @@ $rollbackButton.Add_Click({
         Start-Sleep -Seconds 1
         Update-AllStatus
         
-        $rollbackButton.Text = "⏪ Rollback"
+        $rollbackButton.Text = "<< Rollback"
         $hardenButton.Enabled = $true
         $refreshButton.Enabled = $true
         $selectAllButton.Enabled = $true
@@ -1198,7 +1198,7 @@ $buttonPanel.Controls.Add($rollbackButton)
 
 # Export Button
 $exportButton = New-Object System.Windows.Forms.Button
-$exportButton.Text = "📋 Copy Log"
+$exportButton.Text = "Copy Log"
 $exportButton.Location = New-Object System.Drawing.Point(545, 5)
 $exportButton.Size = New-Object System.Drawing.Size(100, 35)
 $exportButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -1214,7 +1214,7 @@ $buttonPanel.Controls.Add($exportButton)
 
 # Browse Backups Button
 $browseBackupsButton = New-Object System.Windows.Forms.Button
-$browseBackupsButton.Text = "📂"
+$browseBackupsButton.Text = "..."
 $browseBackupsButton.Location = New-Object System.Drawing.Point(655, 5)
 $browseBackupsButton.Size = New-Object System.Drawing.Size(35, 35)
 $browseBackupsButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
