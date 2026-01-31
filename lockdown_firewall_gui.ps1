@@ -99,7 +99,11 @@ function Get-CurrentConfiguration {
     
     # WPAD settings
     try {
-        # Service
+        # Service start type via registry
+        $svcStart = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WinHttpAutoProxySvc" -Name "Start" -ErrorAction SilentlyContinue
+        $config.WPAD.ServiceStart = if ($svcStart) { $svcStart.Start } else { $null }
+        
+        # Service status
         $wpadService = Get-Service -Name "WinHttpAutoProxySvc" -ErrorAction SilentlyContinue
         if ($wpadService) {
             $config.WPAD.Service = @{
@@ -112,9 +116,21 @@ function Get-CurrentConfiguration {
         $autoDetect = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoDetect" -ErrorAction SilentlyContinue
         $config.WPAD.AutoDetect = if ($autoDetect) { $autoDetect.AutoDetect } else { $null }
         
+        # Registry - DisableProxyAuthenticationSchemes
+        $proxyAuth = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "DisableProxyAuthenticationSchemes" -ErrorAction SilentlyContinue
+        $config.WPAD.DisableProxyAuthenticationSchemes = if ($proxyAuth) { $proxyAuth.DisableProxyAuthenticationSchemes } else { $null }
+        
         # Registry - DisableWpad
         $disableWpad = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp" -Name "DisableWpad" -ErrorAction SilentlyContinue
         $config.WPAD.DisableWpad = if ($disableWpad) { $disableWpad.DisableWpad } else { $null }
+        
+        # Registry - WpadOverride (HKLM)
+        $wpadOverride = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad" -Name "WpadOverride" -ErrorAction SilentlyContinue
+        $config.WPAD.WpadOverride = if ($wpadOverride) { $wpadOverride.WpadOverride } else { $null }
+        
+        # Registry - WpadOverride (HKCU)
+        $wpadOverrideUser = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad" -Name "WpadOverride" -ErrorAction SilentlyContinue
+        $config.WPAD.WpadOverrideUser = if ($wpadOverrideUser) { $wpadOverrideUser.WpadOverride } else { $null }
     }
     catch {
         $config.WPAD.Error = $_.Exception.Message
@@ -217,7 +233,7 @@ function Restore-Configuration {
     Write-Log "========================================"
     
     # Restore Firewall Profiles
-    Write-Log "`r`n[1/6] Restoring Firewall settings..."
+    Write-Log "`r`n[1/7] Restoring Firewall settings..."
     try {
         foreach ($profileName in @("Domain", "Private", "Public")) {
             if ($config.Firewall.$profileName) {
@@ -232,7 +248,7 @@ function Restore-Configuration {
     }
     
     # Restore Inbound Rules
-    Write-Log "`r`n[2/6] Restoring Inbound Firewall Rules..."
+    Write-Log "`r`n[2/7] Restoring Inbound Firewall Rules..."
     try {
         $rulesRestored = 0
         foreach ($ruleConfig in $config.InboundRules) {
@@ -254,7 +270,7 @@ function Restore-Configuration {
     }
     
     # Restore NetBIOS
-    Write-Log "`r`n[3/6] Restoring NetBIOS settings..."
+    Write-Log "`r`n[3/7] Restoring NetBIOS settings..."
     try {
         if ($config.NetBIOS.Adapters) {
             foreach ($adapterConfig in $config.NetBIOS.Adapters) {
@@ -286,8 +302,14 @@ function Restore-Configuration {
     }
     
     # Restore WPAD
-    Write-Log "`r`n[4/6] Restoring WPAD settings..."
+    Write-Log "`r`n[4/7] Restoring WPAD settings..."
     try {
+        # Service start type via registry
+        if ($null -ne $config.WPAD.ServiceStart) {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WinHttpAutoProxySvc" -Name "Start" -Value $config.WPAD.ServiceStart -Type DWord -ErrorAction SilentlyContinue
+            Write-Log "  OK: WinHttpAutoProxySvc Start restored to $($config.WPAD.ServiceStart)"
+        }
+        
         # Service
         if ($config.WPAD.Service) {
             $startType = $config.WPAD.Service.StartType
@@ -301,7 +323,7 @@ function Restore-Configuration {
                     Start-Service -Name "WinHttpAutoProxySvc" -ErrorAction SilentlyContinue
                 }
             }
-            Write-Log "  OK: WinHttpAutoProxySvc restored to $startType"
+            Write-Log "  OK: WinHttpAutoProxySvc service restored to $startType"
         }
         
         # AutoDetect registry
@@ -309,6 +331,17 @@ function Restore-Configuration {
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoDetect" -Value $config.WPAD.AutoDetect -Type DWord -ErrorAction SilentlyContinue
             Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoDetect" -Value $config.WPAD.AutoDetect -Type DWord -ErrorAction SilentlyContinue
             Write-Log "  OK: AutoDetect restored to $($config.WPAD.AutoDetect)"
+        }
+        
+        # DisableProxyAuthenticationSchemes registry
+        $internetSettingsPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if ($null -ne $config.WPAD.DisableProxyAuthenticationSchemes) {
+            Set-ItemProperty -Path $internetSettingsPath -Name "DisableProxyAuthenticationSchemes" -Value $config.WPAD.DisableProxyAuthenticationSchemes -Type DWord
+            Write-Log "  OK: DisableProxyAuthenticationSchemes restored to $($config.WPAD.DisableProxyAuthenticationSchemes)"
+        }
+        elseif ($config.WPAD.DisableProxyAuthenticationSchemes -eq $null) {
+            Remove-ItemProperty -Path $internetSettingsPath -Name "DisableProxyAuthenticationSchemes" -ErrorAction SilentlyContinue
+            Write-Log "  OK: DisableProxyAuthenticationSchemes registry key removed"
         }
         
         # DisableWpad registry
@@ -319,9 +352,32 @@ function Restore-Configuration {
             Write-Log "  OK: DisableWpad restored to $($config.WPAD.DisableWpad)"
         }
         elseif ($config.WPAD.DisableWpad -eq $null) {
-            # Remove the key if it didn't exist before
             Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp" -Name "DisableWpad" -ErrorAction SilentlyContinue
             Write-Log "  OK: DisableWpad registry key removed"
+        }
+        
+        # WpadOverride (HKLM)
+        $wpadPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad"
+        if ($null -ne $config.WPAD.WpadOverride) {
+            if (-not (Test-Path $wpadPath)) { New-Item -Path $wpadPath -Force | Out-Null }
+            Set-ItemProperty -Path $wpadPath -Name "WpadOverride" -Value $config.WPAD.WpadOverride -Type DWord
+            Write-Log "  OK: WpadOverride (HKLM) restored to $($config.WPAD.WpadOverride)"
+        }
+        elseif ($config.WPAD.WpadOverride -eq $null) {
+            Remove-ItemProperty -Path $wpadPath -Name "WpadOverride" -ErrorAction SilentlyContinue
+            Write-Log "  OK: WpadOverride (HKLM) registry key removed"
+        }
+        
+        # WpadOverride (HKCU)
+        $wpadUserPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad"
+        if ($null -ne $config.WPAD.WpadOverrideUser) {
+            if (-not (Test-Path $wpadUserPath)) { New-Item -Path $wpadUserPath -Force | Out-Null }
+            Set-ItemProperty -Path $wpadUserPath -Name "WpadOverride" -Value $config.WPAD.WpadOverrideUser -Type DWord
+            Write-Log "  OK: WpadOverride (HKCU) restored to $($config.WPAD.WpadOverrideUser)"
+        }
+        elseif ($config.WPAD.WpadOverrideUser -eq $null) {
+            Remove-ItemProperty -Path $wpadUserPath -Name "WpadOverride" -ErrorAction SilentlyContinue
+            Write-Log "  OK: WpadOverride (HKCU) registry key removed"
         }
     }
     catch {
@@ -329,7 +385,7 @@ function Restore-Configuration {
     }
     
     # Restore mDNS
-    Write-Log "`r`n[5/6] Restoring mDNS settings..."
+    Write-Log "`r`n[5/7] Restoring mDNS settings..."
     try {
         if ($null -ne $config.MDNS.EnableMDNS) {
             $dnsParams = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"
@@ -506,26 +562,51 @@ function Get-WPADStatus {
         $vulnerable = $false
         $details = @()
         
-        $wpadService = Get-Service -Name "WinHttpAutoProxySvc" -ErrorAction SilentlyContinue
-        if ($wpadService -and $wpadService.Status -eq "Running") {
-            $vulnerable = $true
-            $details += "Service running"
+        # Check WinHttpAutoProxySvc service (via registry - more reliable)
+        $svcStart = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WinHttpAutoProxySvc" -Name "Start" -ErrorAction SilentlyContinue
+        if (-not $svcStart -or $svcStart.Start -ne 4) {
+            # Also check if service is running
+            $wpadService = Get-Service -Name "WinHttpAutoProxySvc" -ErrorAction SilentlyContinue
+            if ($wpadService -and $wpadService.Status -eq "Running") {
+                $vulnerable = $true
+                $details += "Service running"
+            }
+            elseif (-not $svcStart -or $svcStart.Start -lt 3) {
+                $vulnerable = $true
+                $details += "Service enabled"
+            }
         }
         
+        # Check registry AutoDetect (HKLM)
         $autoDetect = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoDetect" -ErrorAction SilentlyContinue
         if (-not $autoDetect -or $autoDetect.AutoDetect -ne 0) {
             $vulnerable = $true
-            $details += "AutoDetect enabled"
+            $details += "AutoDetect on"
         }
         
+        # Check WinHttp DisableWpad
         $disableWpad = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp" -Name "DisableWpad" -ErrorAction SilentlyContinue
         if (-not $disableWpad -or $disableWpad.DisableWpad -ne 1) {
             $vulnerable = $true
-            $details += "WinHttp WPAD enabled"
+            $details += "WinHttp WPAD on"
+        }
+        
+        # Check WpadOverride
+        $wpadOverride = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad" -Name "WpadOverride" -ErrorAction SilentlyContinue
+        if (-not $wpadOverride -or $wpadOverride.WpadOverride -ne 1) {
+            $vulnerable = $true
+            $details += "No WPAD override"
+        }
+        
+        # Check DisableProxyAuthenticationSchemes (should be 0xF to disable all)
+        $proxyAuth = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "DisableProxyAuthenticationSchemes" -ErrorAction SilentlyContinue
+        if (-not $proxyAuth -or $proxyAuth.DisableProxyAuthenticationSchemes -lt 0xF) {
+            $vulnerable = $true
+            $details += "Proxy auth enabled"
         }
         
         if (-not $vulnerable) {
-            return @{ Status = "Secure"; Color = "Green"; Detail = "WPAD disabled" }
+            return @{ Status = "Secure"; Color = "Green"; Detail = "WPAD fully disabled" }
         }
         else {
             return @{ Status = "Vulnerable"; Color = "Red"; Detail = ($details -join ", ") }
@@ -782,22 +863,58 @@ function Invoke-Hardening {
         $stepNum++
         Write-Log "`r`n[$stepNum/$totalSteps] Disabling WPAD..."
         try {
+            # Disable WinHttpAutoProxySvc service via registry (more reliable than Set-Service)
+            $svcPath = "HKLM:\SYSTEM\CurrentControlSet\Services\WinHttpAutoProxySvc"
+            if (Test-Path $svcPath) {
+                Set-ItemProperty -Path $svcPath -Name "Start" -Value 4 -Type DWord -ErrorAction SilentlyContinue
+                Write-Log "  OK: WinHttpAutoProxySvc service disabled via registry"
+            }
+            
+            # Also try the standard service disable
             Stop-Service -Name "WinHttpAutoProxySvc" -Force -ErrorAction SilentlyContinue
             Set-Service -Name "WinHttpAutoProxySvc" -StartupType Disabled -ErrorAction SilentlyContinue
-            Write-Log "  OK: WinHttpAutoProxySvc disabled"
             
+            # Disable AutoDetect in Internet Settings (HKLM)
             $internetSettingsPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings"
             Set-ItemProperty -Path $internetSettingsPath -Name "AutoDetect" -Value 0 -Type DWord -ErrorAction Stop
             Write-Log "  OK: AutoDetect disabled (HKLM)"
             
+            # Disable AutoDetect in Internet Settings (HKCU)
             Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoDetect" -Value 0 -Type DWord -ErrorAction SilentlyContinue
             Write-Log "  OK: AutoDetect disabled (HKCU)"
             
+            # Disable proxy authentication schemes to prevent credential leakage
+            # Bitmask: 0x1=Basic, 0x2=Digest, 0x4=NTLM, 0x8=Negotiate
+            # 0xF (15) disables all schemes
+            Set-ItemProperty -Path $internetSettingsPath -Name "DisableProxyAuthenticationSchemes" -Value 0xF -Type DWord
+            Write-Log "  OK: Proxy authentication schemes disabled (prevents credential theft)"
+            
+            # Disable WPAD in WinHttp
             $winhttpPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp"
             if (-not (Test-Path $winhttpPath)) { New-Item -Path $winhttpPath -Force | Out-Null }
             Set-ItemProperty -Path $winhttpPath -Name "DisableWpad" -Value 1 -Type DWord
             Write-Log "  OK: WinHttp WPAD disabled"
             
+            # Create/set WPAD override key
+            $wpadPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad"
+            if (-not (Test-Path $wpadPath)) { New-Item -Path $wpadPath -Force | Out-Null }
+            Set-ItemProperty -Path $wpadPath -Name "WpadOverride" -Value 1 -Type DWord
+            Write-Log "  OK: WPAD override enabled"
+            
+            # Disable WPAD for current user
+            $wpadUserPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Wpad"
+            if (-not (Test-Path $wpadUserPath)) { New-Item -Path $wpadUserPath -Force | Out-Null }
+            Set-ItemProperty -Path $wpadUserPath -Name "WpadOverride" -Value 1 -Type DWord
+            Write-Log "  OK: WPAD override enabled (HKCU)"
+            
+            # Disable proxy auto-config via Connections settings
+            $connectionsPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections"
+            if (Test-Path $connectionsPath) {
+                # DefaultConnectionSettings byte 9 controls auto-detect (bit 4 = 0x08)
+                # This is complex binary data, so we'll just ensure AutoDetect is off via other means
+            }
+            
+            # Block WPAD in hosts file
             $hostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
             $hostsContent = Get-Content $hostsFile -Raw -ErrorAction SilentlyContinue
             if ($hostsContent -notmatch "(?m)^\s*[\d\.]+\s+wpad\s*$") {
@@ -806,6 +923,16 @@ function Invoke-Hardening {
             }
             else {
                 Write-Log "  INFO: WPAD already in hosts file"
+            }
+            
+            # Also block wpad with common domain suffixes
+            $domain = (Get-WmiObject Win32_ComputerSystem).Domain
+            if ($domain -and $domain -ne "WORKGROUP") {
+                $wpadDomain = "wpad.$domain"
+                if ($hostsContent -notmatch "(?m)^\s*[\d\.]+\s+$([regex]::Escape($wpadDomain))\s*$") {
+                    Add-Content -Path $hostsFile -Value "0.0.0.0 $wpadDomain"
+                    Write-Log "  OK: $wpadDomain blocked in hosts file"
+                }
             }
         }
         catch {
