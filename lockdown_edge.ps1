@@ -100,7 +100,7 @@ $form.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
 $titleLabel = New-Object System.Windows.Forms.Label
 $titleLabel.Location = New-Object System.Drawing.Point(20, 15)
 $titleLabel.Size = New-Object System.Drawing.Size(640, 30)
-$titleLabel.Text = "🛡️ Microsoft Edge Privacy & Customization Settings"
+$titleLabel.Text = "[Shield] Microsoft Edge Privacy & Customization Settings"
 $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
 $titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 102, 153)
 $form.Controls.Add($titleLabel)
@@ -110,10 +110,10 @@ $adminLabel = New-Object System.Windows.Forms.Label
 $adminLabel.Location = New-Object System.Drawing.Point(20, 48)
 $adminLabel.Size = New-Object System.Drawing.Size(640, 20)
 if ($isAdmin) {
-    $adminLabel.Text = "✓ Running as Administrator - Machine-wide policies available"
+    $adminLabel.Text = "[OK] Running as Administrator - Machine-wide policies available"
     $adminLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
 } else {
-    $adminLabel.Text = "⚠ Running as User - Only user-level policies available (Run as Admin for full control)"
+    $adminLabel.Text = "[!] Running as User - Only user-level policies available (Run as Admin for full control)"
     $adminLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 100, 0)
 }
 $form.Controls.Add($adminLabel)
@@ -351,7 +351,7 @@ $buttonY = 605
 $btnApply = New-Object System.Windows.Forms.Button
 $btnApply.Location = New-Object System.Drawing.Point(20, $buttonY)
 $btnApply.Size = New-Object System.Drawing.Size(140, 35)
-$btnApply.Text = "✓ Apply Settings"
+$btnApply.Text = "Apply Settings"
 $btnApply.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
 $btnApply.ForeColor = [System.Drawing.Color]::White
 $btnApply.FlatStyle = "Flat"
@@ -515,7 +515,7 @@ $btnApply.Add_Click({
     
     # Update status
     if ($errorCount -eq 0 -and $successCount -gt 0) {
-        $statusLabel.Text = "✓ Successfully applied $successCount settings! Restart Edge to see changes."
+        $statusLabel.Text = "[OK] Successfully applied $successCount settings! Restart Edge to see changes."
         $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
     } elseif ($successCount -gt 0) {
         $statusLabel.Text = "Applied $successCount settings with $errorCount errors. Run as Admin for full access."
@@ -552,7 +552,7 @@ $btnReset.Add_Click({
                 $cb.Checked = $false
             }
             
-            $statusLabel.Text = "✓ All policies removed. Restart Edge to restore default behavior."
+            $statusLabel.Text = "[OK] All policies removed. Restart Edge to restore default behavior."
             $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
         } catch {
             $statusLabel.Text = "Error resetting policies: $_"
