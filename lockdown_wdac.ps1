@@ -90,28 +90,84 @@ function Get-WDACStatus {
     }
 }
 
+function Test-FilePathRulesSupported {
+    # FilePath rules require Windows 10 1903 (build 18362) or later
+    $build = [System.Environment]::OSVersion.Version.Build
+    return $build -ge 18362
+}
+
+function New-DownloadsBlockingPolicy {
+    param(
+        [string]$BasePolicyPath,
+        [string]$OutputPath,
+        [bool]$AuditMode = $true
+    )
+    
+    try {
+        if (-not (Test-FilePathRulesSupported)) {
+            return @{
+                Success = $false
+                Message = "FilePath rules require Windows 10 version 1903 or later."
+            }
+        }
+        
+        # Create a deny policy for Downloads folder using New-CIPolicy
+        $downloadsPath = "%OSDRIVE%\Users\*\Downloads\*"
+        $policyPath = Join-Path $OutputPath "DownloadsBlocking.xml"
+        
+        # Create a new deny policy using PowerShell cmdlets
+        if (Get-Command New-CIPolicy -ErrorAction SilentlyContinue) {
+            # Create policy with file path rule
+            $rule = New-CIPolicyRule -FilePathRule $downloadsPath -Deny
+            New-CIPolicy -FilePath $policyPath -Rules $rule -UserPEs
+            
+            if ($AuditMode) {
+                Set-RuleOption -FilePath $policyPath -Option 3  # Audit Mode
+            }
+            else {
+                Set-RuleOption -FilePath $policyPath -Option 3 -Delete
+            }
+            
+            return @{
+                Success = $true
+                PolicyPath = $policyPath
+                Message = "Downloads blocking policy created successfully."
+            }
+        }
+        else {
+            return @{
+                Success = $false
+                Message = "New-CIPolicy cmdlet not available. Install RSAT or use Windows 10/11 Enterprise/Education."
+            }
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Message = "Error creating Downloads blocking policy: $($_.Exception.Message)"
+        }
+    }
+}
+
 function New-WDACPolicyXml {
     param(
         [string]$PolicyName,
         [string]$PolicyType,
-        [bool]$BlockDownloadsFolder = $false,
+        [bool]$BlockDownloadsFolder = $false,  # Kept for compatibility, handled separately
         [bool]$AuditMode = $true
     )
-    
-    $policyId = [guid]::NewGuid().ToString()
-    $basePolicyId = [guid]::NewGuid().ToString()
     
     # Define rule options based on policy type
     $ruleOptions = @()
     
     # Common options
     if ($AuditMode) {
-        $ruleOptions += '<Option>Enabled:Audit Mode</Option>'
+        $ruleOptions += '<Rule><Option>Enabled:Audit Mode</Option></Rule>'
     }
-    $ruleOptions += '<Option>Enabled:UMCI</Option>'
-    $ruleOptions += '<Option>Enabled:Inherit Default Policy</Option>'
-    $ruleOptions += '<Option>Enabled:Unsigned System Integrity Policy</Option>'
-    $ruleOptions += '<Option>Enabled:Update Policy No Reboot</Option>'
+    $ruleOptions += '<Rule><Option>Enabled:UMCI</Option></Rule>'
+    $ruleOptions += '<Rule><Option>Enabled:Unsigned System Integrity Policy</Option></Rule>'
+    $ruleOptions += '<Rule><Option>Enabled:Update Policy No Reboot</Option></Rule>'
+    $ruleOptions += '<Rule><Option>Required:Enforce Store Applications</Option></Rule>'
     
     # Build signers and rules based on policy type
     $allowedSigners = ""
@@ -141,22 +197,18 @@ function New-WDACPolicyXml {
         <Signer ID="ID_SIGNER_HAL" Name="Microsoft HAL">
             <CertRoot Type="Wellknown" Value="08" />
         </Signer>
-        <Signer ID="ID_SIGNER_THIRD_PARTY" Name="Third Party Signed">
-            <CertRoot Type="TBS" Value="*" />
-        </Signer>
 "@
             $allowedSigners = @"
-        <AllowedSigners>
-            <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
-            <AllowedSigner SignerId="ID_SIGNER_MSFT" />
-            <AllowedSigner SignerId="ID_SIGNER_STORE" />
-            <AllowedSigner SignerId="ID_SIGNER_WHQL" />
-            <AllowedSigner SignerId="ID_SIGNER_ELAM" />
-            <AllowedSigner SignerId="ID_SIGNER_HAL" />
-            <AllowedSigner SignerId="ID_SIGNER_THIRD_PARTY" />
-        </AllowedSigners>
+            <AllowedSigners>
+                <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
+                <AllowedSigner SignerId="ID_SIGNER_MSFT" />
+                <AllowedSigner SignerId="ID_SIGNER_STORE" />
+                <AllowedSigner SignerId="ID_SIGNER_WHQL" />
+                <AllowedSigner SignerId="ID_SIGNER_ELAM" />
+                <AllowedSigner SignerId="ID_SIGNER_HAL" />
+            </AllowedSigners>
 "@
-            $ruleOptions += '<Option>Enabled:Allow Supplemental Policies</Option>'
+            $ruleOptions += '<Rule><Option>Enabled:Allow Supplemental Policies</Option></Rule>'
         }
         
         "AdminAnything_UserMSOnly" {
@@ -182,14 +234,14 @@ function New-WDACPolicyXml {
         </Signer>
 "@
             $allowedSigners = @"
-        <AllowedSigners>
-            <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
-            <AllowedSigner SignerId="ID_SIGNER_MSFT" />
-            <AllowedSigner SignerId="ID_SIGNER_STORE" />
-            <AllowedSigner SignerId="ID_SIGNER_WHQL" />
-            <AllowedSigner SignerId="ID_SIGNER_ELAM" />
-            <AllowedSigner SignerId="ID_SIGNER_HAL" />
-        </AllowedSigners>
+            <AllowedSigners>
+                <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
+                <AllowedSigner SignerId="ID_SIGNER_MSFT" />
+                <AllowedSigner SignerId="ID_SIGNER_STORE" />
+                <AllowedSigner SignerId="ID_SIGNER_WHQL" />
+                <AllowedSigner SignerId="ID_SIGNER_ELAM" />
+                <AllowedSigner SignerId="ID_SIGNER_HAL" />
+            </AllowedSigners>
 "@
         }
         
@@ -216,14 +268,14 @@ function New-WDACPolicyXml {
         </Signer>
 "@
             $allowedSigners = @"
-        <AllowedSigners>
-            <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
-            <AllowedSigner SignerId="ID_SIGNER_MSFT" />
-            <AllowedSigner SignerId="ID_SIGNER_STORE" />
-            <AllowedSigner SignerId="ID_SIGNER_WHQL" />
-            <AllowedSigner SignerId="ID_SIGNER_ELAM" />
-            <AllowedSigner SignerId="ID_SIGNER_HAL" />
-        </AllowedSigners>
+            <AllowedSigners>
+                <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
+                <AllowedSigner SignerId="ID_SIGNER_MSFT" />
+                <AllowedSigner SignerId="ID_SIGNER_STORE" />
+                <AllowedSigner SignerId="ID_SIGNER_WHQL" />
+                <AllowedSigner SignerId="ID_SIGNER_ELAM" />
+                <AllowedSigner SignerId="ID_SIGNER_HAL" />
+            </AllowedSigners>
 "@
         }
         
@@ -248,64 +300,33 @@ function New-WDACPolicyXml {
         <Signer ID="ID_SIGNER_HAL" Name="Microsoft HAL">
             <CertRoot Type="Wellknown" Value="08" />
         </Signer>
-        <Signer ID="ID_SIGNER_THIRD_PARTY" Name="Third Party Signed">
-            <CertRoot Type="TBS" Value="*" />
-        </Signer>
 "@
             $allowedSigners = @"
-        <AllowedSigners>
-            <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
-            <AllowedSigner SignerId="ID_SIGNER_MSFT" />
-            <AllowedSigner SignerId="ID_SIGNER_STORE" />
-            <AllowedSigner SignerId="ID_SIGNER_WHQL" />
-            <AllowedSigner SignerId="ID_SIGNER_ELAM" />
-            <AllowedSigner SignerId="ID_SIGNER_HAL" />
-            <AllowedSigner SignerId="ID_SIGNER_THIRD_PARTY" />
-        </AllowedSigners>
+            <AllowedSigners>
+                <AllowedSigner SignerId="ID_SIGNER_WINDOWS" />
+                <AllowedSigner SignerId="ID_SIGNER_MSFT" />
+                <AllowedSigner SignerId="ID_SIGNER_STORE" />
+                <AllowedSigner SignerId="ID_SIGNER_WHQL" />
+                <AllowedSigner SignerId="ID_SIGNER_ELAM" />
+                <AllowedSigner SignerId="ID_SIGNER_HAL" />
+            </AllowedSigners>
 "@
         }
-    }
-    
-    # Add Downloads folder blocking rule if requested
-    if ($BlockDownloadsFolder) {
-        $fileRules = @"
-        <Deny ID="ID_DENY_DOWNLOADS_EXE" FriendlyName="Block Downloads EXE" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.exe" />
-        <Deny ID="ID_DENY_DOWNLOADS_DLL" FriendlyName="Block Downloads DLL" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.dll" />
-        <Deny ID="ID_DENY_DOWNLOADS_MSI" FriendlyName="Block Downloads MSI" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.msi" />
-        <Deny ID="ID_DENY_DOWNLOADS_PS1" FriendlyName="Block Downloads PS1" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.ps1" />
-        <Deny ID="ID_DENY_DOWNLOADS_BAT" FriendlyName="Block Downloads BAT" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.bat" />
-        <Deny ID="ID_DENY_DOWNLOADS_CMD" FriendlyName="Block Downloads CMD" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.cmd" />
-        <Deny ID="ID_DENY_DOWNLOADS_VBS" FriendlyName="Block Downloads VBS" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.vbs" />
-        <Deny ID="ID_DENY_DOWNLOADS_JS" FriendlyName="Block Downloads JS" FileName="*" MinimumFileVersion="0.0.0.0" FilePath="%OSDRIVE%\Users\*\Downloads\*.js" />
-"@
-        $fileRuleRefs = @"
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_EXE" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_DLL" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_MSI" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_PS1" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_BAT" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_CMD" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_VBS" />
-            <FileRuleRef RuleID="ID_DENY_DOWNLOADS_JS" />
-"@
     }
     
     $ruleOptionsXml = $ruleOptions -join "`n        "
     
     $policyXml = @"
 <?xml version="1.0" encoding="utf-8"?>
-<SiPolicy xmlns="urn:schemas-microsoft-com:sipolicy" PolicyType="Base Policy">
+<SiPolicy xmlns="urn:schemas-microsoft-com:sipolicy">
     <VersionEx>10.0.0.0</VersionEx>
+    <PolicyTypeID>{A244370E-44C9-4C06-B551-F6016E563076}</PolicyTypeID>
     <PlatformID>{2E07F7E4-194C-4D20-B7C9-6F44A6C5A234}</PlatformID>
-    <PolicyID>{$policyId}</PolicyID>
-    <BasePolicyID>{$basePolicyId}</BasePolicyID>
     <Rules>
         $ruleOptionsXml
     </Rules>
     <EKUs />
-    <FileRules>
-$fileRules
-    </FileRules>
+    <FileRules />
     <Signers>
 $signers
     </Signers>
@@ -321,9 +342,6 @@ $signers
         <SigningScenario Value="12" ID="ID_SIGNINGSCENARIO_USERMODE" FriendlyName="User Mode">
             <ProductSigners>
 $allowedSigners
-                <FileRulesRef>
-$fileRuleRefs
-                </FileRulesRef>
             </ProductSigners>
         </SigningScenario>
     </SigningScenarios>
@@ -396,26 +414,29 @@ function Deploy-WDACPolicy {
             }
         }
         
-        # Deploy the policy
-        $policyDest = "$env:SystemRoot\System32\CodeIntegrity\CiPolicies\Active"
-        if (-not (Test-Path $policyDest)) {
-            New-Item -Path $policyDest -ItemType Directory -Force | Out-Null
+        # Deploy to legacy location first (most compatible)
+        $legacyDest = "$env:SystemRoot\System32\CodeIntegrity\SIPolicy.p7b"
+        Copy-Item -Path $binPath -Destination $legacyDest -Force
+        
+        # Also deploy to multiple policy location for newer systems (Windows 10 1903+)
+        $multiplePolicyDest = "$env:SystemRoot\System32\CodeIntegrity\CiPolicies\Active"
+        if (-not (Test-Path $multiplePolicyDest)) {
+            New-Item -Path $multiplePolicyDest -ItemType Directory -Force | Out-Null
         }
         
-        # Get policy ID from XML
-        [xml]$policyXmlContent = Get-Content $XmlPath
-        $policyId = $policyXmlContent.SiPolicy.PolicyID -replace '[{}]', ''
+        # Generate a GUID for the multiple policy format
+        $newGuid = [guid]::NewGuid().ToString().ToUpper()
+        $destPath = Join-Path $multiplePolicyDest "{$newGuid}.cip"
+        Copy-Item -Path $binPath -Destination $destPath -Force -ErrorAction SilentlyContinue
         
-        $destPath = Join-Path $policyDest "{$policyId}.cip"
-        Copy-Item -Path $binPath -Destination $destPath -Force
-        
-        # Refresh policy
-        if (Get-Command Invoke-CimMethod -ErrorAction SilentlyContinue) {
+        # Refresh policy using CiTool if available (Windows 11)
+        $ciToolPath = "$env:SystemRoot\System32\CiTool.exe"
+        if (Test-Path $ciToolPath) {
             try {
-                Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = $destPath} -ErrorAction SilentlyContinue
+                & $ciToolPath --update-policy $legacyDest 2>&1 | Out-Null
             }
             catch {
-                # Policy will be applied on next reboot
+                # Will apply on reboot
             }
         }
         
@@ -464,6 +485,78 @@ function Remove-WDACPolicy {
         return @{
             Success = $false
             Message = "Error removing policy: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Import-WDACPolicy {
+    param(
+        [string]$XmlPath
+    )
+    
+    try {
+        if (-not (Test-Path $XmlPath)) {
+            return @{
+                Success = $false
+                PolicyInfo = $null
+                Message = "File not found: $XmlPath"
+            }
+        }
+        
+        [xml]$policyXml = Get-Content -Path $XmlPath -Encoding UTF8
+        
+        # Extract policy information
+        $policyInfo = @{
+            PolicyID = $policyXml.SiPolicy.PolicyID
+            BasePolicyID = $policyXml.SiPolicy.BasePolicyID
+            PolicyType = $policyXml.SiPolicy.PolicyType
+            Version = $policyXml.SiPolicy.VersionEx
+            Name = ""
+            Rules = @()
+            SignerCount = 0
+            FileRuleCount = 0
+            IsAuditMode = $false
+            HasUMCI = $false
+        }
+        
+        # Get policy name from settings
+        $nameSetting = $policyXml.SiPolicy.Settings.Setting | Where-Object { $_.ValueName -eq "Name" }
+        if ($nameSetting) {
+            $policyInfo.Name = $nameSetting.Value.String
+        }
+        
+        # Parse rules/options
+        $rules = $policyXml.SiPolicy.Rules.Option
+        if ($rules) {
+            $policyInfo.Rules = @($rules)
+            $policyInfo.IsAuditMode = $rules -contains "Enabled:Audit Mode"
+            $policyInfo.HasUMCI = $rules -contains "Enabled:UMCI"
+        }
+        
+        # Count signers
+        $signers = $policyXml.SiPolicy.Signers.Signer
+        if ($signers) {
+            $policyInfo.SignerCount = @($signers).Count
+        }
+        
+        # Count file rules
+        $fileRules = $policyXml.SiPolicy.FileRules.ChildNodes | Where-Object { $_.NodeType -eq 'Element' }
+        if ($fileRules) {
+            $policyInfo.FileRuleCount = @($fileRules).Count
+        }
+        
+        return @{
+            Success = $true
+            PolicyInfo = $policyInfo
+            XmlPath = $XmlPath
+            Message = "Policy imported successfully."
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            PolicyInfo = $null
+            Message = "Error importing policy: $($_.Exception.Message)"
         }
     }
 }
@@ -605,13 +698,13 @@ function Show-WDACConfigGUI {
     $form.Controls.Add($optionsGroup)
     
     $chkBlockDownloads = New-Object System.Windows.Forms.CheckBox
-    $chkBlockDownloads.Text = "Block executables from Users' Downloads folder"
+    $chkBlockDownloads.Text = "Block executables from Users' Downloads folder (Windows 10 1903+)"
     $chkBlockDownloads.Location = New-Object System.Drawing.Point(20, 30)
     $chkBlockDownloads.Size = New-Object System.Drawing.Size(650, 25)
     $optionsGroup.Controls.Add($chkBlockDownloads)
     
     $descLabelDownloads = New-Object System.Windows.Forms.Label
-    $descLabelDownloads.Text = "    Blocks .exe, .dll, .msi, .ps1, .bat, .cmd, .vbs, .js files from running in any user's Downloads folder."
+    $descLabelDownloads.Text = "    Blocks all files from running in any user's Downloads folder. Requires Windows 10 version 1903 or later."
     $descLabelDownloads.ForeColor = [System.Drawing.Color]::Gray
     $descLabelDownloads.Location = New-Object System.Drawing.Point(35, 52)
     $descLabelDownloads.Size = New-Object System.Drawing.Size(640, 20)
@@ -631,27 +724,36 @@ function Show-WDACConfigGUI {
     $form.Controls.Add($buttonPanel)
     
     $exportButton = New-Object System.Windows.Forms.Button
-    $exportButton.Text = "Export Policy XML"
+    $exportButton.Text = "Export Policy"
     $exportButton.Location = New-Object System.Drawing.Point(0, 10)
-    $exportButton.Size = New-Object System.Drawing.Size(140, 35)
+    $exportButton.Size = New-Object System.Drawing.Size(105, 35)
     $exportButton.FlatStyle = "Flat"
     $exportButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $exportButton.ForeColor = [System.Drawing.Color]::White
     $buttonPanel.Controls.Add($exportButton)
     
+    $importButton = New-Object System.Windows.Forms.Button
+    $importButton.Text = "Import Policy"
+    $importButton.Location = New-Object System.Drawing.Point(115, 10)
+    $importButton.Size = New-Object System.Drawing.Size(105, 35)
+    $importButton.FlatStyle = "Flat"
+    $importButton.BackColor = [System.Drawing.Color]::FromArgb(0, 99, 177)
+    $importButton.ForeColor = [System.Drawing.Color]::White
+    $buttonPanel.Controls.Add($importButton)
+    
     $deployButton = New-Object System.Windows.Forms.Button
     $deployButton.Text = "Deploy Policy"
-    $deployButton.Location = New-Object System.Drawing.Point(150, 10)
-    $deployButton.Size = New-Object System.Drawing.Size(140, 35)
+    $deployButton.Location = New-Object System.Drawing.Point(230, 10)
+    $deployButton.Size = New-Object System.Drawing.Size(105, 35)
     $deployButton.FlatStyle = "Flat"
     $deployButton.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
     $deployButton.ForeColor = [System.Drawing.Color]::White
     $buttonPanel.Controls.Add($deployButton)
     
     $removeButton = New-Object System.Windows.Forms.Button
-    $removeButton.Text = "Remove All Policies"
-    $removeButton.Location = New-Object System.Drawing.Point(300, 10)
-    $removeButton.Size = New-Object System.Drawing.Size(140, 35)
+    $removeButton.Text = "Remove Policies"
+    $removeButton.Location = New-Object System.Drawing.Point(345, 10)
+    $removeButton.Size = New-Object System.Drawing.Size(105, 35)
     $removeButton.FlatStyle = "Flat"
     $removeButton.BackColor = [System.Drawing.Color]::FromArgb(196, 43, 28)
     $removeButton.ForeColor = [System.Drawing.Color]::White
@@ -659,12 +761,15 @@ function Show-WDACConfigGUI {
     
     $helpButton = New-Object System.Windows.Forms.Button
     $helpButton.Text = "Help"
-    $helpButton.Location = New-Object System.Drawing.Point(555, 10)
-    $helpButton.Size = New-Object System.Drawing.Size(140, 35)
+    $helpButton.Location = New-Object System.Drawing.Point(590, 10)
+    $helpButton.Size = New-Object System.Drawing.Size(105, 35)
     $helpButton.FlatStyle = "Flat"
     $helpButton.BackColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
     $helpButton.ForeColor = [System.Drawing.Color]::White
     $buttonPanel.Controls.Add($helpButton)
+    
+    # Variable to store imported policy path
+    $script:importedPolicyPath = $null
     
     # Log Output
     $logGroup = New-Object System.Windows.Forms.GroupBox
@@ -741,7 +846,88 @@ function Show-WDACConfigGUI {
         }
     })
     
+    $importButton.Add_Click({
+        $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+        $openFileDialog.Title = "Select WDAC Policy XML File"
+        $openFileDialog.Filter = "XML Files (*.xml)|*.xml|All Files (*.*)|*.*"
+        $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("MyDocuments")
+        
+        if ($openFileDialog.ShowDialog() -eq "OK") {
+            $result = Import-WDACPolicy -XmlPath $openFileDialog.FileName
+            
+            if ($result.Success) {
+                $script:importedPolicyPath = $result.XmlPath
+                $info = $result.PolicyInfo
+                
+                # Build policy details message
+                $detailsMessage = @"
+Policy Imported Successfully!
+
+FILE: $($result.XmlPath)
+
+POLICY DETAILS:
+  Name: $($info.Name)
+  Policy ID: $($info.PolicyID)
+  Base Policy ID: $($info.BasePolicyID)
+  Policy Type: $($info.PolicyType)
+  Version: $($info.Version)
+
+CONFIGURATION:
+  Audit Mode: $(if ($info.IsAuditMode) { 'Yes' } else { 'No (Enforced)' })
+  User Mode Code Integrity (UMCI): $(if ($info.HasUMCI) { 'Enabled' } else { 'Disabled' })
+  Number of Signers: $($info.SignerCount)
+  Number of File Rules: $($info.FileRuleCount)
+
+ENABLED OPTIONS:
+$($info.Rules | ForEach-Object { "  - $_" } | Out-String)
+Do you want to deploy this imported policy?
+"@
+                
+                $logText.Text = "Imported: $($info.Name) from $($result.XmlPath)"
+                
+                $deployChoice = [System.Windows.Forms.MessageBox]::Show(
+                    $detailsMessage,
+                    "Import Policy",
+                    "YesNo",
+                    "Information"
+                )
+                
+                if ($deployChoice -eq "Yes") {
+                    $deployResult = Deploy-WDACPolicy -XmlPath $result.XmlPath
+                    
+                    if ($deployResult.Success) {
+                        $logText.Text = $deployResult.Message
+                        [System.Windows.Forms.MessageBox]::Show($deployResult.Message, "Deployment Successful", "OK", "Information")
+                        & $updateStatus
+                    }
+                    else {
+                        $logText.Text = $deployResult.Message
+                        [System.Windows.Forms.MessageBox]::Show($deployResult.Message, "Deployment Failed", "OK", "Error")
+                    }
+                }
+            }
+            else {
+                $logText.Text = $result.Message
+                [System.Windows.Forms.MessageBox]::Show($result.Message, "Import Failed", "OK", "Error")
+            }
+        }
+    })
+    
     $deployButton.Add_Click({
+        # Check if Downloads blocking is selected but not supported
+        $canBlockDownloads = Test-FilePathRulesSupported
+        if ($chkBlockDownloads.Checked -and -not $canBlockDownloads) {
+            $warnResult = [System.Windows.Forms.MessageBox]::Show(
+                "The 'Block Downloads folder' option requires Windows 10 version 1903 or later.`n`nYour system does not support FilePath rules. The policy will be deployed WITHOUT Downloads folder blocking.`n`nDo you want to continue?",
+                "Feature Not Supported",
+                "YesNo",
+                "Warning"
+            )
+            if ($warnResult -ne "Yes") {
+                return
+            }
+        }
+        
         $confirmResult = [System.Windows.Forms.MessageBox]::Show(
             "This will deploy a WDAC policy to your system.`n`nAre you sure you want to continue?`n`nNote: A reboot may be required.",
             "Confirm Policy Deployment",
@@ -753,8 +939,9 @@ function Show-WDACConfigGUI {
             $policyType = & $getSelectedPolicyType
             $policyName = & $getSelectedPolicyName
             
+            # Create main policy (without Downloads blocking - that's handled separately)
             $policyXml = New-WDACPolicyXml -PolicyName $policyName -PolicyType $policyType `
-                -BlockDownloadsFolder $chkBlockDownloads.Checked -AuditMode $chkAuditMode.Checked
+                -BlockDownloadsFolder $false -AuditMode $chkAuditMode.Checked
             
             $tempPath = Join-Path $env:TEMP "WDACPolicy_$(Get-Date -Format 'yyyyMMddHHmmss')"
             New-Item -Path $tempPath -ItemType Directory -Force | Out-Null
@@ -766,7 +953,26 @@ function Show-WDACConfigGUI {
                 
                 if ($deployResult.Success) {
                     $logText.Text = $deployResult.Message
-                    [System.Windows.Forms.MessageBox]::Show($deployResult.Message, "Deployment Successful", "OK", "Information")
+                    
+                    # If Downloads blocking is requested and supported, create supplemental policy
+                    if ($chkBlockDownloads.Checked -and $canBlockDownloads) {
+                        $downloadsPolicyResult = New-DownloadsBlockingPolicy -BasePolicyPath $exportResult.XmlPath -OutputPath $tempPath -AuditMode $chkAuditMode.Checked
+                        
+                        if ($downloadsPolicyResult.Success) {
+                            $downloadsDeployResult = Deploy-WDACPolicy -XmlPath $downloadsPolicyResult.PolicyPath
+                            if ($downloadsDeployResult.Success) {
+                                $logText.Text += " | Downloads blocking policy also deployed."
+                            }
+                            else {
+                                $logText.Text += " | Downloads blocking failed: $($downloadsDeployResult.Message)"
+                            }
+                        }
+                        else {
+                            $logText.Text += " | Downloads blocking skipped: $($downloadsPolicyResult.Message)"
+                        }
+                    }
+                    
+                    [System.Windows.Forms.MessageBox]::Show($logText.Text, "Deployment Complete", "OK", "Information")
                     & $updateStatus
                 }
                 else {
@@ -842,6 +1048,26 @@ Audit Mode:
    - Policy violations are logged but not blocked
    - Recommended for testing before enforcement
    - Check Event Viewer: Applications and Services Logs > Microsoft > Windows > CodeIntegrity
+
+BUTTONS:
+
+Export Policy:
+   - Saves the currently configured policy as an XML file
+   - Can be used for backup, review, or deployment via other tools
+
+Import Policy:
+   - Load an existing WDAC policy XML file
+   - View policy details (name, signers, rules, etc.)
+   - Option to deploy the imported policy directly
+
+Deploy Policy:
+   - Applies the configured policy to the system
+   - Converts XML to binary format and installs it
+   - Requires Administrator privileges
+
+Remove Policies:
+   - Removes all deployed WDAC policies
+   - Requires reboot to complete removal
 
 DEPLOYMENT NOTES:
 
