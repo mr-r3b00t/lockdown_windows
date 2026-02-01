@@ -1,1121 +1,1808 @@
+#Requires -RunAsAdministrator
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
-    Microsoft Edge Customization Tool
+    Clone a live Windows volume to a bootable VHDX file.
 .DESCRIPTION
-    GUI tool to configure Microsoft Edge settings via registry policies and profile config.
-    Disables startup wizard, Copilot, translations, writing assistance, and privacy-risking features.
-.NOTES
-    Requires Administrator privileges to modify HKLM policies.
-    Compatible with PowerShell 5.1
+    Creates a VSS snapshot of a running Windows volume and copies it to a bootable
+    VHDX virtual disk. The resulting VHDX can be used in Hyper-V or for Native VHD Boot.
+    
+    Supports both UEFI (GPT) and Legacy BIOS (MBR) boot modes.
+    Supports skipping free space for faster clones (NTFS only).
+.PARAMETER SourceVolume
+    Drive letter of the Windows volume to clone (e.g., "C:" or "C")
+.PARAMETER DestinationVHDX
+    Path for the output VHDX file
+.PARAMETER BootMode
+    Boot mode: "UEFI" (default) or "BIOS"
+.PARAMETER FullCopy
+    Copy all sectors including free space (slower, larger file)
+.PARAMETER FixedSizeVHDX
+    Create a fixed-size VHDX instead of dynamic
+.PARAMETER BlockSizeMB
+    I/O block size in megabytes (default: 4)
+.PARAMETER SkipBootFix
+    Skip boot configuration (creates non-bootable raw clone)
+.PARAMETER Interactive
+    Force interactive menu mode
+.EXAMPLE
+    .\Clone-BootableVolume.ps1
+    Runs in interactive menu mode
+.EXAMPLE
+    .\Clone-BootableVolume.ps1 -SourceVolume "C:" -DestinationVHDX "D:\VMs\Windows.vhdx"
+.EXAMPLE
+    .\Clone-BootableVolume.ps1 -SourceVolume "C:" -DestinationVHDX "D:\VMs\Windows.vhdx" -BootMode BIOS
 #>
 
-# Check for Admin privileges
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-# Registry paths
-$EdgePolicyPathHKLM = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-$EdgePolicyPathHKCU = "HKCU:\SOFTWARE\Policies\Microsoft\Edge"
-
-# Edge user data path
-$EdgeUserDataPath = [System.IO.Path]::Combine($env:LOCALAPPDATA, "Microsoft", "Edge", "User Data")
-
-# Function to get Edge profiles
-function Get-EdgeProfiles {
-    $profiles = @()
+[CmdletBinding(DefaultParameterSetName = 'Interactive')]
+param(
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [string]$SourceVolume,
     
-    if (Test-Path $EdgeUserDataPath) {
-        # Check Local State file for profile info
-        $localStatePath = Join-Path $EdgeUserDataPath "Local State"
-        if (Test-Path $localStatePath) {
-            try {
-                $localState = Get-Content $localStatePath -Raw | ConvertFrom-Json
-                $profileInfo = $localState.profile.info_cache
-                
-                if ($profileInfo) {
-                    foreach ($prop in $profileInfo.PSObject.Properties) {
-                        $profiles += [PSCustomObject]@{
-                            Name = $prop.Name
-                            DisplayName = $prop.Value.name
-                            Path = Join-Path $EdgeUserDataPath $prop.Name
-                        }
-                    }
-                }
-            } catch {
-                # Fallback: scan for profile directories
-            }
-        }
-        
-        # Fallback: Check for Default and Profile folders
-        if ($profiles.Count -eq 0) {
-            $defaultPath = Join-Path $EdgeUserDataPath "Default"
-            if (Test-Path $defaultPath) {
-                $profiles += [PSCustomObject]@{
-                    Name = "Default"
-                    DisplayName = "Default"
-                    Path = $defaultPath
-                }
-            }
-            
-            # Check for Profile 1, Profile 2, etc.
-            Get-ChildItem -Path $EdgeUserDataPath -Directory -Filter "Profile *" -ErrorAction SilentlyContinue | ForEach-Object {
-                $profiles += [PSCustomObject]@{
-                    Name = $_.Name
-                    DisplayName = $_.Name
-                    Path = $_.FullName
-                }
-            }
-        }
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [string]$DestinationVHDX,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [ValidateSet('UEFI', 'BIOS')]
+    [string]$BootMode = 'UEFI',
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$FullCopy,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$FixedSizeVHDX,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [ValidateRange(1, 64)]
+    [int]$BlockSizeMB = 4,
+    
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$SkipBootFix,
+    
+    [Parameter(ParameterSetName = 'Interactive')]
+    [switch]$Interactive
+)
+
+# ============================================================
+# Initialization
+# ============================================================
+
+$ErrorActionPreference = 'Stop'
+
+try {
+    if ($null -ne [Console]::OutputEncoding) {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     }
-    
-    return $profiles
+}
+catch { }
+
+$currentPrincipal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList ([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "This script requires Administrator privileges."
 }
 
-# Function to get default profile
-function Get-DefaultEdgeProfile {
-    $localStatePath = Join-Path $EdgeUserDataPath "Local State"
-    if (Test-Path $localStatePath) {
-        try {
-            $localState = Get-Content $localStatePath -Raw | ConvertFrom-Json
-            $lastUsed = $localState.profile.last_used
-            if ($lastUsed) {
-                return $lastUsed
-            }
-        } catch { }
-    }
-    return "Default"
-}
+# ============================================================
+# Helper Functions
+# ============================================================
 
-# Function to ensure registry path exists with full path creation
-function Ensure-RegistryPath {
-    param([string]$Path)
-    
-    if (-not (Test-Path $Path)) {
-        try {
-            $parts = $Path -replace '^(HKLM:|HKCU:)\\?', '' -split '\\'
-            $root = if ($Path -match '^HKLM:') { 'HKLM:' } else { 'HKCU:' }
-            $currentPath = $root
-            
-            foreach ($part in $parts) {
-                if ([string]::IsNullOrWhiteSpace($part)) { continue }
-                $currentPath = Join-Path $currentPath $part
-                if (-not (Test-Path $currentPath)) {
-                    $null = New-Item -Path $currentPath -Force -ErrorAction Stop
-                }
-            }
-            return $true
-        } catch {
-            return $false
-        }
-    }
-    return $true
-}
-
-# Function to set registry value
-function Set-EdgePolicy {
+function Get-ClampedPercent {
     param(
-        [string]$Name,
-        [object]$Value,
-        [string]$Type = "DWord",
-        [bool]$UseHKLM = $true
+        [Parameter(Mandatory)][double]$Current,
+        [Parameter(Mandatory)][double]$Total
     )
-    
-    $basePath = if ($UseHKLM -and $isAdmin) { $EdgePolicyPathHKLM } else { $EdgePolicyPathHKCU }
-    
-    if (-not (Ensure-RegistryPath -Path $basePath)) {
-        if ($basePath -eq $EdgePolicyPathHKCU) {
-            return $false
-        }
-        $basePath = $EdgePolicyPathHKCU
-        if (-not (Ensure-RegistryPath -Path $basePath)) {
-            return $false
-        }
-    }
-    
-    try {
-        Set-ItemProperty -Path $basePath -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
-        return $true
-    } catch {
-        if ($basePath -eq $EdgePolicyPathHKLM) {
-            $basePath = $EdgePolicyPathHKCU
-            if (Ensure-RegistryPath -Path $basePath) {
-                try {
-                    Set-ItemProperty -Path $basePath -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
-                    return $true
-                } catch {
-                    return $false
-                }
-            }
-        }
-        return $false
-    }
+    if ($Total -le 0) { return 0 }
+    $pct = [math]::Floor(($Current / $Total) * 100)
+    return [int][math]::Min(100, [math]::Max(0, $pct))
 }
 
-# Function to get current registry value
-function Get-EdgePolicy {
-    param([string]$Name)
+function Wait-KeyPress {
+    param([string]$Message = "Press Enter to continue...")
+    Write-Host "  $Message" -ForegroundColor Gray
+    $null = Read-Host
+}
+
+function Get-AvailableDriveLetter {
+    # Get all currently used drive letters
+    $usedLetters = [System.Collections.ArrayList]::new()
     
-    foreach ($path in @($EdgePolicyPathHKLM, $EdgePolicyPathHKCU)) {
-        if (Test-Path $path) {
-            try {
-                $value = Get-ItemProperty -Path $path -Name $Name -ErrorAction SilentlyContinue
-                if ($null -ne $value.$Name) {
-                    return $value.$Name
-                }
-            } catch { }
+    Get-Volume | ForEach-Object {
+        if ($_.DriveLetter) {
+            $null = $usedLetters.Add([string]$_.DriveLetter)
         }
     }
+    
+    Get-CimInstance -ClassName Win32_MappedLogicalDisk -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.DeviceID -and $_.DeviceID.Length -gt 0) {
+            $null = $usedLetters.Add([string]$_.DeviceID[0])
+        }
+    }
+    
+    # Check letters S through Z
+    $candidates = @('S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z')
+    foreach ($letter in $candidates) {
+        if ($letter -notin $usedLetters) {
+            $testPath = "${letter}:\"
+            if (-not (Test-Path -LiteralPath $testPath -ErrorAction SilentlyContinue)) {
+                return $letter
+            }
+        }
+    }
+    
+    # Try N through R as fallback
+    $fallback = @('N', 'O', 'P', 'Q', 'R')
+    foreach ($letter in $fallback) {
+        if ($letter -notin $usedLetters) {
+            $testPath = "${letter}:\"
+            if (-not (Test-Path -LiteralPath $testPath -ErrorAction SilentlyContinue)) {
+                return $letter
+            }
+        }
+    }
+    
     return $null
 }
 
-# Function to modify Edge profile preferences
-function Set-EdgeProfilePreference {
+function Format-Size {
+    param([Parameter(Mandatory)][double]$Bytes)
+    if ($Bytes -ge 1TB) { return "{0:N2} TB" -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
+    return "{0:N0} bytes" -f $Bytes
+}
+
+# ============================================================
+# P/Invoke Definitions
+# ============================================================
+
+$nativeCodeDefinition = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class VirtDiskApi
+{
+    public const uint VIRTUAL_DISK_ACCESS_ALL = 0x003f0000;
+    
+    public const uint CREATE_VIRTUAL_DISK_FLAG_NONE = 0;
+    public const uint CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION = 1;
+    
+    public const uint ATTACH_VIRTUAL_DISK_FLAG_NONE = 0;
+    public const uint ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER = 1;
+    
+    public const uint OPEN_VIRTUAL_DISK_FLAG_NONE = 0;
+    
+    public const int VIRTUAL_STORAGE_TYPE_DEVICE_VHDX = 3;
+    
+    public static readonly Guid VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT = 
+        new Guid("EC984AEC-A0F9-47e9-901F-71415A66345B");
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VIRTUAL_STORAGE_TYPE
+    {
+        public int DeviceId;
+        public Guid VendorId;
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ATTACH_VIRTUAL_DISK_PARAMETERS
+    {
+        public int Version;
+        public int Reserved;
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct OPEN_VIRTUAL_DISK_PARAMETERS
+    {
+        public int Version;
+        public int RWDepth;
+    }
+    
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int CreateVirtualDisk(
+        ref VIRTUAL_STORAGE_TYPE VirtualStorageType,
+        string Path,
+        uint VirtualDiskAccessMask,
+        IntPtr SecurityDescriptor,
+        uint Flags,
+        uint ProviderSpecificFlags,
+        IntPtr Parameters,
+        IntPtr Overlapped,
+        out IntPtr Handle);
+    
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int OpenVirtualDisk(
+        ref VIRTUAL_STORAGE_TYPE VirtualStorageType,
+        string Path,
+        uint VirtualDiskAccessMask,
+        uint Flags,
+        ref OPEN_VIRTUAL_DISK_PARAMETERS Parameters,
+        out IntPtr Handle);
+    
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int AttachVirtualDisk(
+        IntPtr VirtualDiskHandle,
+        IntPtr SecurityDescriptor,
+        uint Flags,
+        uint ProviderSpecificFlags,
+        ref ATTACH_VIRTUAL_DISK_PARAMETERS Parameters,
+        IntPtr Overlapped);
+    
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int DetachVirtualDisk(
+        IntPtr VirtualDiskHandle,
+        uint Flags,
+        uint ProviderSpecificFlags);
+    
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int GetVirtualDiskPhysicalPath(
+        IntPtr VirtualDiskHandle,
+        ref int DiskPathSizeInBytes,
+        IntPtr DiskPath);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+
+public static class NativeDiskApi
+{
+    public const uint GENERIC_READ = 0x80000000;
+    public const uint GENERIC_WRITE = 0x40000000;
+    public const uint FILE_SHARE_READ = 0x00000001;
+    public const uint FILE_SHARE_WRITE = 0x00000002;
+    public const uint OPEN_EXISTING = 3;
+    public const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
+    public const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
+    
+    public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009006F;
+    public const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
+    
+    public const uint FILE_BEGIN = 0;
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NTFS_VOLUME_DATA_BUFFER
+    {
+        public long VolumeSerialNumber;
+        public long NumberSectors;
+        public long TotalClusters;
+        public long FreeClusters;
+        public long TotalReserved;
+        public uint BytesPerSector;
+        public uint BytesPerCluster;
+        public uint BytesPerFileRecordSegment;
+        public uint ClustersPerFileRecordSegment;
+        public long MftValidDataLength;
+        public long MftStartLcn;
+        public long Mft2StartLcn;
+        public long MftZoneStart;
+        public long MftZoneEnd;
+    }
+    
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool DeviceIoControl(
+        SafeFileHandle hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        uint nInBufferSize,
+        IntPtr lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadFile(
+        SafeFileHandle hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToRead,
+        out uint lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteFile(
+        SafeFileHandle hFile,
+        byte[] lpBuffer,
+        uint nNumberOfBytesToWrite,
+        out uint lpNumberOfBytesWritten,
+        IntPtr lpOverlapped);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFilePointerEx(
+        SafeFileHandle hFile,
+        long liDistanceToMove,
+        out long lpNewFilePointer,
+        uint dwMoveMethod);
+}
+'@
+
+# Load types if not already loaded
+$typesLoaded = $false
+try {
+    $null = [VirtDiskApi].Name
+    $null = [NativeDiskApi].Name
+    $typesLoaded = $true
+}
+catch { }
+
+if (-not $typesLoaded) {
+    Add-Type -TypeDefinition $nativeCodeDefinition -Language CSharp -ErrorAction Stop
+}
+
+# ============================================================
+# VHDX Parameter Buffer Functions
+# ============================================================
+
+function New-VhdxParametersBuffer {
     param(
-        [string]$ProfilePath,
-        [string]$SettingPath,
-        [object]$Value
+        [Parameter(Mandatory)][Guid]$UniqueId,
+        [Parameter(Mandatory)][uint64]$MaximumSize
     )
     
-    $prefsPath = Join-Path $ProfilePath "Preferences"
+    # CREATE_VIRTUAL_DISK_PARAMETERS Version 1 layout (x64):
+    # Offset 0:  Version (4 bytes) = 1
+    # Offset 4:  UniqueId (16 bytes GUID)
+    # Offset 20: [4 bytes padding]
+    # Offset 24: MaximumSize (8 bytes)
+    # Offset 32: BlockSizeInBytes (4 bytes)
+    # Offset 36: SectorSizeInBytes (4 bytes)
+    # Offset 40: ParentPath (8 bytes pointer)
+    # Offset 48: SourcePath (8 bytes pointer)
+    # Total: 56 bytes
     
-    if (-not (Test-Path $prefsPath)) {
-        return $false
+    $bufferSize = 56
+    $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bufferSize)
+    
+    # Zero out the entire buffer
+    for ($i = 0; $i -lt $bufferSize; $i++) {
+        [System.Runtime.InteropServices.Marshal]::WriteByte($ptr, $i, 0)
     }
+    
+    # Version = 1 at offset 0
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 0, 1)
+    
+    # UniqueId at offset 4
+    $guidBytes = $UniqueId.ToByteArray()
+    [System.Runtime.InteropServices.Marshal]::Copy($guidBytes, 0, [IntPtr]::Add($ptr, 4), 16)
+    
+    # MaximumSize at offset 24
+    [System.Runtime.InteropServices.Marshal]::WriteInt64($ptr, 24, [long]$MaximumSize)
+    
+    # BlockSizeInBytes at offset 32 = 0 (use default)
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 32, 0)
+    
+    # SectorSizeInBytes at offset 36 = 512
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($ptr, 36, 512)
+    
+    # ParentPath and SourcePath at offsets 40 and 48 are already zero
+    
+    return $ptr
+}
+
+function Remove-VhdxParametersBuffer {
+    param([IntPtr]$Ptr)
+    if ($Ptr -ne [IntPtr]::Zero) {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Ptr)
+    }
+}
+
+# ============================================================
+# VSS Functions
+# ============================================================
+
+function New-VssSnapshot {
+    param([Parameter(Mandatory)][string]$Volume)
+    
+    if (-not $Volume.EndsWith('\')) { 
+        $Volume = $Volume + '\' 
+    }
+    
+    Write-Host "Creating VSS snapshot for $Volume..." -ForegroundColor Cyan
+    
+    $result = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{
+        Volume  = $Volume
+        Context = 'ClientAccessible'
+    }
+    
+    if ($result.ReturnValue -ne 0) {
+        $errorMessages = @{
+            1  = 'Access denied'
+            2  = 'Invalid argument'
+            3  = 'Volume not found'
+            4  = 'Volume not supported'
+            5  = 'Unsupported context'
+            6  = 'Insufficient storage'
+            7  = 'Volume in use'
+            8  = 'Max shadow copies reached'
+            9  = 'Operation in progress'
+            10 = 'Provider vetoed'
+            11 = 'Provider not registered'
+            12 = 'Provider failure'
+        }
+        $msg = $errorMessages[[int]$result.ReturnValue]
+        if (-not $msg) { $msg = "Unknown error" }
+        throw "Failed to create shadow copy. Error $($result.ReturnValue): $msg"
+    }
+    
+    $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $result.ShadowID }
+    if (-not $shadowCopy) { 
+        throw "Shadow copy created but could not be retrieved." 
+    }
+    
+    return @{
+        Id           = $result.ShadowID
+        DeviceObject = $shadowCopy.DeviceObject
+        VolumeName   = $Volume
+    }
+}
+
+function Remove-VssSnapshot {
+    param([Parameter(Mandatory)][string]$ShadowId)
+    
+    Write-Host "Removing VSS snapshot..." -ForegroundColor Cyan
+    
+    $shadow = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $ShadowId }
+    if ($shadow) { 
+        Remove-CimInstance -InputObject $shadow -ErrorAction SilentlyContinue 
+    }
+}
+
+# ============================================================
+# Virtual Disk Functions
+# ============================================================
+
+function New-RawVHDX {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][uint64]$SizeBytes,
+        [switch]$FixedSize
+    )
+    
+    $typeStr = if ($FixedSize) { "Fixed" } else { "Dynamic" }
+    Write-Host "Creating $typeStr VHDX: $Path ($(Format-Size $SizeBytes))..." -ForegroundColor Cyan
+    
+    # Ensure directory exists
+    $parentDir = Split-Path -Path $Path -Parent
+    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {
+        $null = New-Item -Path $parentDir -ItemType Directory -Force
+    }
+    
+    # Remove existing file
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force
+    }
+    
+    # Try using Hyper-V cmdlet first (most reliable)
+    $hyperVAvailable = $false
+    try {
+        $null = Get-Command -Name New-VHD -ErrorAction Stop
+        $hyperVAvailable = $true
+    }
+    catch { }
+    
+    if ($hyperVAvailable) {
+        Write-Host "  Using Hyper-V cmdlet..." -ForegroundColor DarkGray
+        
+        try {
+            if ($FixedSize) {
+                $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Fixed -ErrorAction Stop
+            }
+            else {
+                $null = New-VHD -Path $Path -SizeBytes $SizeBytes -Dynamic -ErrorAction Stop
+            }
+            
+            # Open with virtdisk API to get a handle
+            $storageType = New-Object -TypeName VirtDiskApi+VIRTUAL_STORAGE_TYPE
+            $storageType.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
+            $storageType.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
+            
+            $openParams = New-Object -TypeName VirtDiskApi+OPEN_VIRTUAL_DISK_PARAMETERS
+            $openParams.Version = 1
+            $openParams.RWDepth = 0
+            
+            $handle = [IntPtr]::Zero
+            $result = [VirtDiskApi]::OpenVirtualDisk(
+                [ref]$storageType,
+                $Path,
+                [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL,
+                [VirtDiskApi]::OPEN_VIRTUAL_DISK_FLAG_NONE,
+                [ref]$openParams,
+                [ref]$handle
+            )
+            
+            if ($result -ne 0) {
+                $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+                throw "OpenVirtualDisk failed: $($win32Err.Message)"
+            }
+            
+            return $handle
+        }
+        catch {
+            Write-Host "  Hyper-V method failed: $_" -ForegroundColor Yellow
+            Write-Host "  Trying VirtDisk API..." -ForegroundColor Yellow
+            
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    
+    # Method 2: Manual P/Invoke
+    Write-Host "  Using VirtDisk API..." -ForegroundColor DarkGray
+    
+    # Align size to MB boundary
+    $SizeBytes = [uint64]([math]::Ceiling($SizeBytes / 1MB) * 1MB)
+    
+    $storageType = New-Object -TypeName VirtDiskApi+VIRTUAL_STORAGE_TYPE
+    $storageType.DeviceId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
+    $storageType.VendorId = [VirtDiskApi]::VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT
+    
+    $uniqueId = [Guid]::NewGuid()
+    $paramsPtr = New-VhdxParametersBuffer -UniqueId $uniqueId -MaximumSize $SizeBytes
     
     try {
-        $prefs = Get-Content $prefsPath -Raw -ErrorAction Stop | ConvertFrom-Json
-        
-        # Navigate/create the path
-        $pathParts = $SettingPath -split '\.'
-        $current = $prefs
-        
-        for ($i = 0; $i -lt $pathParts.Count - 1; $i++) {
-            $part = $pathParts[$i]
-            if (-not $current.PSObject.Properties[$part]) {
-                $current | Add-Member -NotePropertyName $part -NotePropertyValue ([PSCustomObject]@{}) -Force
-            }
-            $current = $current.$part
+        $flags = if ($FixedSize) { 
+            [VirtDiskApi]::CREATE_VIRTUAL_DISK_FLAG_FULL_PHYSICAL_ALLOCATION 
+        } 
+        else { 
+            [VirtDiskApi]::CREATE_VIRTUAL_DISK_FLAG_NONE 
         }
         
-        $lastPart = $pathParts[-1]
-        if ($current.PSObject.Properties[$lastPart]) {
-            $current.$lastPart = $Value
-        } else {
-            $current | Add-Member -NotePropertyName $lastPart -NotePropertyValue $Value -Force
-        }
-        
-        $prefs | ConvertTo-Json -Depth 100 -Compress | Set-Content $prefsPath -Encoding UTF8 -Force
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-# Function to apply profile settings
-function Apply-ProfileSettings {
-    param(
-        [string]$ProfilePath,
-        [hashtable]$Settings
-    )
-    
-    $prefsPath = Join-Path $ProfilePath "Preferences"
-    
-    if (-not (Test-Path $prefsPath)) {
-        return 0
-    }
-    
-    $successCount = 0
-    
-    try {
-        # Read existing preferences
-        $prefsContent = Get-Content $prefsPath -Raw -ErrorAction Stop
-        $prefs = $prefsContent | ConvertFrom-Json
-        
-        foreach ($settingPath in $Settings.Keys) {
-            $value = $Settings[$settingPath]
-            $pathParts = $settingPath -split '\.'
-            $current = $prefs
-            
-            # Navigate/create the path
-            for ($i = 0; $i -lt $pathParts.Count - 1; $i++) {
-                $part = $pathParts[$i]
-                if (-not $current.PSObject.Properties[$part]) {
-                    $current | Add-Member -NotePropertyName $part -NotePropertyValue ([PSCustomObject]@{}) -Force
-                }
-                $current = $current.$part
-            }
-            
-            $lastPart = $pathParts[-1]
-            if ($current.PSObject.Properties[$lastPart]) {
-                $current.$lastPart = $value
-            } else {
-                $current | Add-Member -NotePropertyName $lastPart -NotePropertyValue $value -Force
-            }
-            $successCount++
-        }
-        
-        # Write back
-        $prefs | ConvertTo-Json -Depth 100 | Set-Content $prefsPath -Encoding UTF8 -Force
-        
-    } catch {
-        return 0
-    }
-    
-    return $successCount
-}
-
-# Create main form
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Microsoft Edge Customization Tool"
-$form.Size = New-Object System.Drawing.Size(700, 780)
-$form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedSingle"
-$form.MaximizeBox = $false
-$form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-
-# Title label
-$titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(20, 10)
-$titleLabel.Size = New-Object System.Drawing.Size(660, 28)
-$titleLabel.Text = "Microsoft Edge Privacy and Customization Settings"
-$titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
-$titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 102, 153)
-$form.Controls.Add($titleLabel)
-
-# Admin status label
-$adminLabel = New-Object System.Windows.Forms.Label
-$adminLabel.Location = New-Object System.Drawing.Point(20, 38)
-$adminLabel.Size = New-Object System.Drawing.Size(660, 18)
-if ($isAdmin) {
-    $adminLabel.Text = "[OK] Running as Administrator - Machine-wide policies available"
-    $adminLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
-} else {
-    $adminLabel.Text = "[!] Running as User - Only user-level policies available (Run as Admin for full control)"
-    $adminLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 100, 0)
-}
-$form.Controls.Add($adminLabel)
-
-# Profile selection
-$lblProfile = New-Object System.Windows.Forms.Label
-$lblProfile.Location = New-Object System.Drawing.Point(20, 60)
-$lblProfile.Size = New-Object System.Drawing.Size(100, 22)
-$lblProfile.Text = "Edge Profile:"
-$form.Controls.Add($lblProfile)
-
-$cboProfile = New-Object System.Windows.Forms.ComboBox
-$cboProfile.Location = New-Object System.Drawing.Point(120, 58)
-$cboProfile.Size = New-Object System.Drawing.Size(250, 24)
-$cboProfile.DropDownStyle = "DropDownList"
-$form.Controls.Add($cboProfile)
-
-# Populate profiles
-$profiles = Get-EdgeProfiles
-$defaultProfile = Get-DefaultEdgeProfile
-foreach ($profile in $profiles) {
-    $idx = $cboProfile.Items.Add("$($profile.DisplayName) ($($profile.Name))")
-    if ($profile.Name -eq $defaultProfile) {
-        $cboProfile.SelectedIndex = $idx
-    }
-}
-if ($cboProfile.SelectedIndex -lt 0 -and $cboProfile.Items.Count -gt 0) {
-    $cboProfile.SelectedIndex = 0
-}
-
-$chkApplyToAllProfiles = New-Object System.Windows.Forms.CheckBox
-$chkApplyToAllProfiles.Location = New-Object System.Drawing.Point(380, 60)
-$chkApplyToAllProfiles.Size = New-Object System.Drawing.Size(180, 22)
-$chkApplyToAllProfiles.Text = "Apply to all profiles"
-$form.Controls.Add($chkApplyToAllProfiles)
-
-# Create TabControl
-$tabControl = New-Object System.Windows.Forms.TabControl
-$tabControl.Location = New-Object System.Drawing.Point(20, 88)
-$tabControl.Size = New-Object System.Drawing.Size(645, 555)
-$form.Controls.Add($tabControl)
-
-# Tab 1: Startup and First Run
-$tabStartup = New-Object System.Windows.Forms.TabPage
-$tabStartup.Text = "Startup"
-$tabStartup.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabStartup)
-
-# Tab 2: Copilot and AI
-$tabCopilot = New-Object System.Windows.Forms.TabPage
-$tabCopilot.Text = "Copilot / AI"
-$tabCopilot.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabCopilot)
-
-# Tab 3: Privacy and Telemetry
-$tabPrivacy = New-Object System.Windows.Forms.TabPage
-$tabPrivacy.Text = "Privacy"
-$tabPrivacy.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabPrivacy)
-
-# Tab 4: Features and Integrations
-$tabFeatures = New-Object System.Windows.Forms.TabPage
-$tabFeatures.Text = "Features"
-$tabFeatures.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabFeatures)
-
-# Tab 5: Search and New Tab
-$tabSearch = New-Object System.Windows.Forms.TabPage
-$tabSearch.Text = "Search / New Tab"
-$tabSearch.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabSearch)
-
-# Tab 6: Language and Writing
-$tabLanguage = New-Object System.Windows.Forms.TabPage
-$tabLanguage.Text = "Language / Writing"
-$tabLanguage.BackColor = [System.Drawing.Color]::White
-$tabControl.Controls.Add($tabLanguage)
-
-# Helper function to create checkboxes
-function New-SettingCheckbox {
-    param(
-        [System.Windows.Forms.Control]$Parent,
-        [string]$Text,
-        [string]$Description,
-        [int]$Y,
-        [string]$Tag
-    )
-    
-    $cb = New-Object System.Windows.Forms.CheckBox
-    $cb.Location = New-Object System.Drawing.Point(15, $Y)
-    $cb.Size = New-Object System.Drawing.Size(600, 22)
-    $cb.Text = $Text
-    $cb.Tag = $Tag
-    $cb.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-    $Parent.Controls.Add($cb)
-    
-    $descLabel = New-Object System.Windows.Forms.Label
-    $descLabel.Location = New-Object System.Drawing.Point(32, ($Y + 22))
-    $descLabel.Size = New-Object System.Drawing.Size(590, 18)
-    $descLabel.Text = $Description
-    $descLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-    $descLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-    $Parent.Controls.Add($descLabel)
-    
-    return $cb
-}
-
-# ===== TAB 1: STARTUP AND FIRST RUN =====
-$y = 15
-
-$chkHideFirstRun = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "HideFirstRunExperience" `
-    -Text "Disable First Run Experience / Welcome Wizard" `
-    -Description "Prevents the initial setup wizard and welcome screens from appearing"
-$y += 48
-
-$chkDisableImportOnLaunch = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "ImportOnEachLaunch" `
-    -Text "Disable Import Prompt on Each Launch" `
-    -Description "Stops Edge from prompting to import data from other browsers"
-$y += 48
-
-$chkRestoreOnStartup = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "RestoreOnStartup" `
-    -Text "Open Blank Page on Startup (instead of previous session)" `
-    -Description "Starts Edge with a blank page rather than restoring previous tabs"
-$y += 48
-
-$chkDisableProfilePicker = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "BrowserGuestModeEnabled" `
-    -Text "Disable Profile Picker on Startup" `
-    -Description "Skips the profile selection screen when launching Edge"
-$y += 48
-
-$chkDisableSigninPrompt = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "BrowserSignin" `
-    -Text "Disable Sign-in Prompt" `
-    -Description "Prevents Edge from prompting you to sign in with a Microsoft account"
-$y += 48
-
-$chkDisableDefaultBrowserPrompt = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "DefaultBrowserSettingEnabled" `
-    -Text "Disable Set as Default Browser Prompt" `
-    -Description "Stops Edge from asking to be set as the default browser"
-$y += 48
-
-$chkDisableAutoImport = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "AutoImportAtFirstRun" `
-    -Text "Disable Automatic Data Import from Other Browsers" `
-    -Description "Prevents automatic import of bookmarks, history, etc. from other browsers"
-$y += 48
-
-$chkDisableEdgeUpdate = New-SettingCheckbox -Parent $tabStartup -Y $y -Tag "EdgeUpdateDisabled" `
-    -Text "Disable Edge Auto-Update Prompts" `
-    -Description "Stops update notifications and prompts"
-
-# ===== TAB 2: COPILOT AND AI =====
-$y = 15
-
-$chkDisableCopilot = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "CopilotEnabled" `
-    -Text "Disable Copilot Completely" `
-    -Description "Disables Microsoft Copilot integration entirely"
-$y += 48
-
-$chkDisableCopilotSidebar = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "CopilotSidebar" `
-    -Text "Disable Copilot Sidebar" `
-    -Description "Removes the Copilot button and sidebar panel"
-$y += 48
-
-$chkDisableCopilotPageContext = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "CopilotPageContext" `
-    -Text "Disable Copilot Page Context Access" `
-    -Description "Prevents Copilot from reading your current page content"
-$y += 48
-
-$chkDisableCopilotCompose = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "CopilotCompose" `
-    -Text "Disable Copilot Compose (Text Generation)" `
-    -Description "Disables AI text generation and rewriting features"
-$y += 48
-
-$chkDisableDesignerAI = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "DesignerAI" `
-    -Text "Disable Designer / Image Creator AI" `
-    -Description "Disables AI image generation features"
-$y += 48
-
-$chkDisableBingChat = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "BingChat" `
-    -Text "Disable Bing Chat / Discover" `
-    -Description "Disables Bing Chat integration and Discover feature"
-$y += 48
-
-$chkDisableAIThemes = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "AIThemes" `
-    -Text "Disable AI-Generated Themes" `
-    -Description "Disables AI theme suggestions and generation"
-$y += 48
-
-$chkDisableImageEnhance = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "ImageEnhance" `
-    -Text "Disable AI Image Enhancement" `
-    -Description "Disables automatic AI image enhancement features"
-$y += 48
-
-$chkDisableMathSolver = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "MathSolver" `
-    -Text "Disable Math Solver AI" `
-    -Description "Disables the AI-powered math solver feature"
-$y += 48
-
-$chkDisableDropAI = New-SettingCheckbox -Parent $tabCopilot -Y $y -Tag "DropAI" `
-    -Text "Disable Drop (AI File Sharing)" `
-    -Description "Disables the Drop feature with AI capabilities"
-
-# ===== TAB 3: PRIVACY AND TELEMETRY =====
-$y = 15
-
-$chkDisableTelemetry = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "MetricsReportingEnabled" `
-    -Text "Disable Telemetry and Usage Data Collection" `
-    -Description "Prevents Edge from sending usage statistics and crash reports to Microsoft"
-$y += 48
-
-$chkDisableDiagnostics = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "DiagnosticData" `
-    -Text "Disable Diagnostic Data Collection" `
-    -Description "Minimizes diagnostic data sent to Microsoft"
-$y += 48
-
-$chkDisablePersonalization = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "PersonalizationReportingEnabled" `
-    -Text "Disable Personalization and Ad Tracking" `
-    -Description "Prevents browsing data from being used for personalized ads"
-$y += 48
-
-$chkEnableTrackingPrevention = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "TrackingPrevention" `
-    -Text "Enable Strict Tracking Prevention" `
-    -Description "Sets tracking prevention to the strictest level"
-$y += 48
-
-$chkEnableDNT = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "ConfigureDoNotTrack" `
-    -Text "Enable Do Not Track Requests" `
-    -Description "Sends Do Not Track header with browsing requests"
-$y += 48
-
-$chkDisableSendSiteInfo = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "SendSiteInfoToImproveServices" `
-    -Text "Disable Send Site Info to Improve Services" `
-    -Description "Stops sending browsing data to improve Microsoft services"
-$y += 48
-
-$chkDisableNetworkPrediction = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "NetworkPredictionOptions" `
-    -Text "Disable Network Prediction / Preloading" `
-    -Description "Prevents Edge from pre-fetching pages, which can leak browsing intent"
-$y += 48
-
-$chkDisableTypingInsights = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "TypingInsights" `
-    -Text "Disable Typing Insights" `
-    -Description "Prevents collection of typing patterns and behavior"
-$y += 48
-
-$chkDisableResolveNav = New-SettingCheckbox -Parent $tabPrivacy -Y $y -Tag "ResolveNavigationErrors" `
-    -Text "Disable Navigation Error Resolution" `
-    -Description "Prevents sending failed URLs to Microsoft for suggestions"
-
-# ===== TAB 4: FEATURES AND INTEGRATIONS =====
-$y = 15
-
-$chkDisableSidebar = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "HubsSidebarEnabled" `
-    -Text "Disable Sidebar / Edge Bar" `
-    -Description "Removes the sidebar panel from Edge"
-$y += 48
-
-$chkDisableCollections = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "EdgeCollectionsEnabled" `
-    -Text "Disable Collections Feature" `
-    -Description "Disables the Collections feature for saving content"
-$y += 48
-
-$chkDisableShopping = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "EdgeShoppingAssistantEnabled" `
-    -Text "Disable Shopping Assistant" `
-    -Description "Disables price comparison and coupon features"
-$y += 48
-
-$chkDisableSync = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "SyncDisabled" `
-    -Text "Disable Sync Functionality" `
-    -Description "Prevents syncing of bookmarks, history, and settings across devices"
-$y += 48
-
-$chkDisableWallet = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "EdgeWalletCheckoutEnabled" `
-    -Text "Disable Edge Wallet / Payment Features" `
-    -Description "Disables the built-in wallet and payment autofill"
-$y += 48
-
-$chkDisableFeedback = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "UserFeedbackAllowed" `
-    -Text "Disable Feedback Prompts" `
-    -Description "Stops Edge from asking for feedback"
-$y += 48
-
-$chkDisableMiniMenu = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "QuickSearchShowMiniMenu" `
-    -Text "Disable Quick Search Mini Menu (on text selection)" `
-    -Description "Disables the popup menu when selecting text"
-$y += 48
-
-$chkDisableWorkspaces = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "Workspaces" `
-    -Text "Disable Workspaces" `
-    -Description "Disables the Workspaces collaborative feature"
-$y += 48
-
-$chkDisableGames = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "Games" `
-    -Text "Disable Built-in Games" `
-    -Description "Disables Edge's built-in games feature"
-$y += 48
-
-$chkDisableRewards = New-SettingCheckbox -Parent $tabFeatures -Y $y -Tag "Rewards" `
-    -Text "Disable Microsoft Rewards Integration" `
-    -Description "Disables Microsoft Rewards prompts and integration"
-
-# ===== TAB 5: SEARCH AND NEW TAB =====
-$y = 15
-
-$chkBlankHomepage = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "HomepageLocation" `
-    -Text "Set Homepage to Blank (about:blank)" `
-    -Description "Sets the homepage to a blank page instead of MSN"
-$y += 48
-
-$chkBlankNewTab = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "NewTabPageLocation" `
-    -Text "Set New Tab Page to Blank" `
-    -Description "Opens a blank page for new tabs instead of the news feed"
-$y += 48
-
-$chkDisableNewsFeed = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "NewTabPageContentEnabled" `
-    -Text "Disable News Feed on New Tab Page" `
-    -Description "Removes the news content from the new tab page"
-$y += 48
-
-$chkDisableQuickLinks = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "NewTabPageQuickLinksEnabled" `
-    -Text "Disable Quick Links on New Tab Page" `
-    -Description "Removes suggested sites from the new tab page"
-$y += 48
-
-$chkDisableSearchSuggestions = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "SearchSuggestEnabled" `
-    -Text "Disable Search Suggestions" `
-    -Description "Prevents sending keystrokes to search engine for suggestions"
-$y += 48
-
-$chkDisableAddressBarSuggestions = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "AddressBarMicrosoftSearchInBingProviderEnabled" `
-    -Text "Disable Microsoft Search in Bing Suggestions" `
-    -Description "Removes Microsoft Search suggestions from address bar"
-$y += 48
-
-$chkDisableSpotlight = New-SettingCheckbox -Parent $tabSearch -Y $y -Tag "Spotlight" `
-    -Text "Disable Spotlight (Background Images with Info)" `
-    -Description "Disables background images and related content on new tab"
-
-# Custom homepage textbox
-$lblCustomHomepage = New-Object System.Windows.Forms.Label
-$lblCustomHomepage.Location = New-Object System.Drawing.Point(15, ($y + 55))
-$lblCustomHomepage.Size = New-Object System.Drawing.Size(150, 22)
-$lblCustomHomepage.Text = "Custom Homepage URL:"
-$lblCustomHomepage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$tabSearch.Controls.Add($lblCustomHomepage)
-
-$txtCustomHomepage = New-Object System.Windows.Forms.TextBox
-$txtCustomHomepage.Location = New-Object System.Drawing.Point(170, ($y + 53))
-$txtCustomHomepage.Size = New-Object System.Drawing.Size(400, 24)
-$txtCustomHomepage.Text = "about:blank"
-$tabSearch.Controls.Add($txtCustomHomepage)
-
-# ===== TAB 6: LANGUAGE AND WRITING =====
-$y = 15
-
-$chkDisableTranslate = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "TranslateEnabled" `
-    -Text "Disable Translation Features" `
-    -Description "Disables automatic translation prompts and features"
-$y += 48
-
-$chkDisableTranslatePrompt = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "TranslatePrompt" `
-    -Text "Disable Translation Prompt/Popup" `
-    -Description "Stops the translate this page popup from appearing"
-$y += 48
-
-$chkDisableWritingAssist = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "WritingAssistant" `
-    -Text "Disable Writing Assistant (Rewrite/Compose)" `
-    -Description "Disables AI-powered writing assistance features"
-$y += 48
-
-$chkDisableEditorService = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "EditorService" `
-    -Text "Disable Microsoft Editor (Grammar/Spelling Service)" `
-    -Description "Disables cloud-based grammar and spelling suggestions"
-$y += 48
-
-$chkDisableSpellcheck = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "SpellcheckEnabled" `
-    -Text "Disable Cloud Spellcheck Service" `
-    -Description "Disables cloud-based spellchecking that sends typed text to Microsoft"
-$y += 48
-
-$chkDisableTextPrediction = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "TextPrediction" `
-    -Text "Disable Text Prediction" `
-    -Description "Disables predictive text suggestions while typing"
-$y += 48
-
-$chkDisableAutoCorrect = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "AutoCorrect" `
-    -Text "Disable Auto-Correct" `
-    -Description "Disables automatic correction of typos"
-$y += 48
-
-$chkDisableReadAloud = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "ReadAloud" `
-    -Text "Disable Read Aloud Feature" `
-    -Description "Disables the text-to-speech read aloud feature"
-$y += 48
-
-$chkDisablePDFAnnotate = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "PDFAnnotate" `
-    -Text "Disable PDF AI Features" `
-    -Description "Disables AI summarization and chat for PDFs"
-$y += 48
-
-$chkDisableImmersiveReader = New-SettingCheckbox -Parent $tabLanguage -Y $y -Tag "ImmersiveReader" `
-    -Text "Disable Immersive Reader Enhancements" `
-    -Description "Disables AI-powered reading mode enhancements"
-
-# ===== BUTTONS =====
-$buttonY = 653
-
-$btnApply = New-Object System.Windows.Forms.Button
-$btnApply.Location = New-Object System.Drawing.Point(20, $buttonY)
-$btnApply.Size = New-Object System.Drawing.Size(130, 35)
-$btnApply.Text = "Apply Settings"
-$btnApply.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-$btnApply.ForeColor = [System.Drawing.Color]::White
-$btnApply.FlatStyle = "Flat"
-$btnApply.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnApply)
-
-$btnSelectAll = New-Object System.Windows.Forms.Button
-$btnSelectAll.Location = New-Object System.Drawing.Point(160, $buttonY)
-$btnSelectAll.Size = New-Object System.Drawing.Size(100, 35)
-$btnSelectAll.Text = "Select All"
-$btnSelectAll.FlatStyle = "Flat"
-$form.Controls.Add($btnSelectAll)
-
-$btnDeselectAll = New-Object System.Windows.Forms.Button
-$btnDeselectAll.Location = New-Object System.Drawing.Point(270, $buttonY)
-$btnDeselectAll.Size = New-Object System.Drawing.Size(100, 35)
-$btnDeselectAll.Text = "Deselect All"
-$btnDeselectAll.FlatStyle = "Flat"
-$form.Controls.Add($btnDeselectAll)
-
-$btnReset = New-Object System.Windows.Forms.Button
-$btnReset.Location = New-Object System.Drawing.Point(380, $buttonY)
-$btnReset.Size = New-Object System.Drawing.Size(100, 35)
-$btnReset.Text = "Reset All"
-$btnReset.BackColor = [System.Drawing.Color]::FromArgb(200, 80, 80)
-$btnReset.ForeColor = [System.Drawing.Color]::White
-$btnReset.FlatStyle = "Flat"
-$form.Controls.Add($btnReset)
-
-$btnExport = New-Object System.Windows.Forms.Button
-$btnExport.Location = New-Object System.Drawing.Point(490, $buttonY)
-$btnExport.Size = New-Object System.Drawing.Size(80, 35)
-$btnExport.Text = "Export"
-$btnExport.FlatStyle = "Flat"
-$form.Controls.Add($btnExport)
-
-$btnExit = New-Object System.Windows.Forms.Button
-$btnExit.Location = New-Object System.Drawing.Point(580, $buttonY)
-$btnExit.Size = New-Object System.Drawing.Size(80, 35)
-$btnExit.Text = "Exit"
-$btnExit.FlatStyle = "Flat"
-$form.Controls.Add($btnExit)
-
-# Status label
-$statusLabel = New-Object System.Windows.Forms.Label
-$statusLabel.Location = New-Object System.Drawing.Point(20, 695)
-$statusLabel.Size = New-Object System.Drawing.Size(640, 40)
-$statusLabel.Text = "Ready. Select options and click Apply Settings. Close Edge before applying."
-$statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
-$form.Controls.Add($statusLabel)
-
-# ===== EVENT HANDLERS =====
-
-function Get-AllCheckboxes {
-    $checkboxes = @()
-    foreach ($tab in $tabControl.TabPages) {
-        foreach ($control in $tab.Controls) {
-            if ($control -is [System.Windows.Forms.CheckBox]) {
-                $checkboxes += $control
-            }
-        }
-    }
-    return $checkboxes
-}
-
-$btnSelectAll.Add_Click({
-    foreach ($cb in (Get-AllCheckboxes)) {
-        $cb.Checked = $true
-    }
-})
-
-$btnDeselectAll.Add_Click({
-    foreach ($cb in (Get-AllCheckboxes)) {
-        $cb.Checked = $false
-    }
-})
-
-# Apply Settings
-$btnApply.Add_Click({
-    $successCount = 0
-    $errorCount = 0
-    
-    $statusLabel.Text = "Applying settings... Please ensure Edge is closed."
-    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 100, 200)
-    $form.Refresh()
-    
-    # Registry policy mappings
-    $policySettings = @{
-        # Startup
-        "HideFirstRunExperience" = @{ Checkbox = $chkHideFirstRun; Value = 1 }
-        "ImportOnEachLaunch" = @{ Checkbox = $chkDisableImportOnLaunch; Value = 0 }
-        "RestoreOnStartup" = @{ Checkbox = $chkRestoreOnStartup; Value = 5 }
-        "BrowserSignin" = @{ Checkbox = $chkDisableSigninPrompt; Value = 0 }
-        "DefaultBrowserSettingEnabled" = @{ Checkbox = $chkDisableDefaultBrowserPrompt; Value = 0 }
-        "AutoImportAtFirstRun" = @{ Checkbox = $chkDisableAutoImport; Value = 4 }
-        "PromotionalTabsEnabled" = @{ Checkbox = $chkDisableEdgeUpdate; Value = 0 }
-        
-        # Copilot and AI
-        "HubsSidebarEnabled" = @{ Checkbox = $chkDisableCopilotSidebar; Value = 0 }
-        "CopilotCDPPageContext" = @{ Checkbox = $chkDisableCopilotPageContext; Value = 0 }
-        "DiscoverPageContextEnabled" = @{ Checkbox = $chkDisableBingChat; Value = 0 }
-        "EdgeAssetDeliveryServiceEnabled" = @{ Checkbox = $chkDisableAIThemes; Value = 0 }
-        "ShowAcrobatSubscriptionButton" = @{ Checkbox = $chkDisablePDFAnnotate; Value = 0 }
-        
-        # Privacy
-        "MetricsReportingEnabled" = @{ Checkbox = $chkDisableTelemetry; Value = 0 }
-        "DiagnosticData" = @{ Checkbox = $chkDisableDiagnostics; Value = 0 }
-        "PersonalizationReportingEnabled" = @{ Checkbox = $chkDisablePersonalization; Value = 0 }
-        "TrackingPrevention" = @{ Checkbox = $chkEnableTrackingPrevention; Value = 3 }
-        "ConfigureDoNotTrack" = @{ Checkbox = $chkEnableDNT; Value = 1 }
-        "SendSiteInfoToImproveServices" = @{ Checkbox = $chkDisableSendSiteInfo; Value = 0 }
-        "NetworkPredictionOptions" = @{ Checkbox = $chkDisableNetworkPrediction; Value = 2 }
-        "TypingInsightsEnabled" = @{ Checkbox = $chkDisableTypingInsights; Value = 0 }
-        "ResolveNavigationErrorsUseWebService" = @{ Checkbox = $chkDisableResolveNav; Value = 0 }
-        
-        # Features
-        "EdgeCollectionsEnabled" = @{ Checkbox = $chkDisableCollections; Value = 0 }
-        "EdgeShoppingAssistantEnabled" = @{ Checkbox = $chkDisableShopping; Value = 0 }
-        "SyncDisabled" = @{ Checkbox = $chkDisableSync; Value = 1 }
-        "EdgeWalletCheckoutEnabled" = @{ Checkbox = $chkDisableWallet; Value = 0 }
-        "UserFeedbackAllowed" = @{ Checkbox = $chkDisableFeedback; Value = 0 }
-        "ConfigureSharePreviewType" = @{ Checkbox = $chkDisableMiniMenu; Value = 0 }
-        "EdgeWorkspacesEnabled" = @{ Checkbox = $chkDisableWorkspaces; Value = 0 }
-        "AllowGamesMenu" = @{ Checkbox = $chkDisableGames; Value = 0 }
-        "ShowMicrosoftRewards" = @{ Checkbox = $chkDisableRewards; Value = 0 }
-        
-        # Search and New Tab
-        "NewTabPageContentEnabled" = @{ Checkbox = $chkDisableNewsFeed; Value = 0 }
-        "NewTabPageQuickLinksEnabled" = @{ Checkbox = $chkDisableQuickLinks; Value = 0 }
-        "SearchSuggestEnabled" = @{ Checkbox = $chkDisableSearchSuggestions; Value = 0 }
-        "AddressBarMicrosoftSearchInBingProviderEnabled" = @{ Checkbox = $chkDisableAddressBarSuggestions; Value = 0 }
-        "NewTabPageAllowedBackgroundTypes" = @{ Checkbox = $chkDisableSpotlight; Value = 3 }
-        
-        # Language and Writing
-        "TranslateEnabled" = @{ Checkbox = $chkDisableTranslate; Value = 0 }
-        "ShowRecommendationsForTranslationsEnabled" = @{ Checkbox = $chkDisableTranslatePrompt; Value = 0 }
-        "SpellcheckEnabled" = @{ Checkbox = $chkDisableSpellcheck; Value = 0 }
-        "TextPredictionEnabled" = @{ Checkbox = $chkDisableTextPrediction; Value = 0 }
-        "ImmersiveReaderGrammarToolsEnabled" = @{ Checkbox = $chkDisableImmersiveReader; Value = 0 }
-    }
-    
-    # Apply registry policies
-    foreach ($key in $policySettings.Keys) {
-        $setting = $policySettings[$key]
-        if ($setting.Checkbox.Checked) {
-            if (Set-EdgePolicy -Name $key -Value $setting.Value) {
-                $successCount++
-            } else {
-                $errorCount++
-            }
-        }
-    }
-    
-    # Handle Copilot master disable (multiple keys)
-    if ($chkDisableCopilot.Checked) {
-        $copilotKeys = @(
-            @{ Name = "CopilotPageContext"; Value = 0 },
-            @{ Name = "CopilotCDPPageContext"; Value = 0 },
-            @{ Name = "HubsSidebarEnabled"; Value = 0 },
-            @{ Name = "DiscoverPageContextEnabled"; Value = 0 }
+        $handle = [IntPtr]::Zero
+        $result = [VirtDiskApi]::CreateVirtualDisk(
+            [ref]$storageType,
+            $Path,
+            [VirtDiskApi]::VIRTUAL_DISK_ACCESS_ALL,
+            [IntPtr]::Zero,
+            $flags,
+            0,
+            $paramsPtr,
+            [IntPtr]::Zero,
+            [ref]$handle
         )
-        foreach ($ck in $copilotKeys) {
-            if (Set-EdgePolicy -Name $ck.Name -Value $ck.Value) { $successCount++ } else { $errorCount++ }
-        }
-    }
-    
-    # Handle Compose/Writing Assistant
-    if ($chkDisableCopilotCompose.Checked -or $chkDisableWritingAssist.Checked) {
-        Set-EdgePolicy -Name "ComposeInlineEnabled" -Value 0 | Out-Null
-        Set-EdgePolicy -Name "QuickSearchShowMiniMenu" -Value 0 | Out-Null
-        $successCount++
-    }
-    
-    # Handle Editor service
-    if ($chkDisableEditorService.Checked) {
-        Set-EdgePolicy -Name "SpellcheckEnabled" -Value 0 | Out-Null
-        Set-EdgePolicy -Name "SpellcheckLanguage" -Value "" -Type "String" | Out-Null
-        $successCount++
-    }
-    
-    # Handle Homepage
-    if ($chkBlankHomepage.Checked) {
-        $homepage = if ($txtCustomHomepage.Text) { $txtCustomHomepage.Text } else { "about:blank" }
-        if (Set-EdgePolicy -Name "HomepageLocation" -Value $homepage -Type "String") { $successCount++ } else { $errorCount++ }
-        Set-EdgePolicy -Name "HomepageIsNewTabPage" -Value 0 | Out-Null
-        Set-EdgePolicy -Name "ShowHomeButton" -Value 1 | Out-Null
-    }
-    
-    # Handle New Tab Page
-    if ($chkBlankNewTab.Checked) {
-        if (Set-EdgePolicy -Name "NewTabPageLocation" -Value "about:blank" -Type "String") { $successCount++ } else { $errorCount++ }
-    }
-    
-    # Handle RestoreOnStartup with URL
-    if ($chkRestoreOnStartup.Checked) {
-        $basePath = if ($isAdmin) { $EdgePolicyPathHKLM } else { $EdgePolicyPathHKCU }
-        $startupPath = "$basePath\RestoreOnStartupURLs"
-        if (Ensure-RegistryPath -Path $startupPath) {
-            try {
-                Set-ItemProperty -Path $startupPath -Name "1" -Value "about:blank" -Type "String" -Force
-            } catch { }
-        }
-    }
-    
-    # Handle sidebar disable
-    if ($chkDisableSidebar.Checked) {
-        Set-EdgePolicy -Name "HubsSidebarEnabled" -Value 0 | Out-Null
-        Set-EdgePolicy -Name "StandaloneHubsSidebarEnabled" -Value 0 | Out-Null
-    }
-    
-    # ===== PROFILE SETTINGS =====
-    $profileCount = 0
-    $profilesToApply = @()
-    
-    if ($chkApplyToAllProfiles.Checked) {
-        $profilesToApply = $profiles
-    } elseif ($cboProfile.SelectedIndex -ge 0 -and $profiles.Count -gt 0) {
-        $profilesToApply = @($profiles[$cboProfile.SelectedIndex])
-    }
-    
-    foreach ($profile in $profilesToApply) {
-        $profileSettings = @{}
         
-        # Copilot/AI profile settings
-        if ($chkDisableCopilot.Checked) {
-            $profileSettings["browser.copilot_enabled"] = $false
-            $profileSettings["edge_copilot.visible"] = $false
-        }
-        if ($chkDisableCopilotSidebar.Checked) {
-            $profileSettings["browser.show_hub_apps_tower"] = $false
-            $profileSettings["sidebar.show_on_startup"] = $false
-        }
-        if ($chkDisableCopilotPageContext.Checked) {
-            $profileSettings["edge_copilot.page_context_enabled"] = $false
-        }
-        if ($chkDisableDesignerAI.Checked) {
-            $profileSettings["edge_creator.enabled"] = $false
-        }
-        if ($chkDisableBingChat.Checked) {
-            $profileSettings["edge_discover.visible"] = $false
-        }
-        if ($chkDisableMathSolver.Checked) {
-            $profileSettings["math_solver.enabled"] = $false
-        }
-        if ($chkDisableDropAI.Checked) {
-            $profileSettings["edge_drop.enabled"] = $false
+        if ($result -ne 0) {
+            $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+            throw "CreateVirtualDisk failed: $($win32Err.Message) (Error: $result)"
         }
         
-        # Translation settings
-        if ($chkDisableTranslate.Checked -or $chkDisableTranslatePrompt.Checked) {
-            $profileSettings["translate.enabled"] = $false
-            $profileSettings["translate_page.enabled"] = $false
-        }
-        
-        # Writing/Editor settings
-        if ($chkDisableWritingAssist.Checked -or $chkDisableCopilotCompose.Checked) {
-            $profileSettings["browser.enable_spellchecking"] = $false
-            $profileSettings["edge_write.enabled"] = $false
-        }
-        if ($chkDisableEditorService.Checked -or $chkDisableSpellcheck.Checked) {
-            $profileSettings["browser.enable_spellchecking"] = $false
-            $profileSettings["spellcheck.use_spelling_service"] = $false
-        }
-        if ($chkDisableTextPrediction.Checked) {
-            $profileSettings["browser.text_prediction_enabled"] = $false
-        }
-        if ($chkDisableAutoCorrect.Checked) {
-            $profileSettings["browser.auto_correct_enabled"] = $false
-        }
-        if ($chkDisableReadAloud.Checked) {
-            $profileSettings["edge_read_aloud.enabled"] = $false
-        }
-        
-        # Privacy settings
-        if ($chkDisableTelemetry.Checked) {
-            $profileSettings["user_experience_metrics.reporting_enabled"] = $false
-        }
-        if ($chkDisablePersonalization.Checked) {
-            $profileSettings["personalization.enabled"] = $false
-        }
-        
-        # Features settings
-        if ($chkDisableCollections.Checked) {
-            $profileSettings["edge_collections.enabled"] = $false
-        }
-        if ($chkDisableShopping.Checked) {
-            $profileSettings["edge_shopping.enabled"] = $false
-        }
-        if ($chkDisableWallet.Checked) {
-            $profileSettings["edge_wallet.enabled"] = $false
-        }
-        
-        # Search settings
-        if ($chkDisableSearchSuggestions.Checked) {
-            $profileSettings["search.suggest_enabled"] = $false
-        }
-        
-        # Apply profile settings
-        if ($profileSettings.Count -gt 0) {
-            $applied = Apply-ProfileSettings -ProfilePath $profile.Path -Settings $profileSettings
-            $profileCount += $applied
-        }
+        return $handle
     }
-    
-    # Update status
-    $totalSuccess = $successCount + $profileCount
-    if ($errorCount -eq 0 -and $totalSuccess -gt 0) {
-        $statusLabel.Text = "Success! Applied $successCount policies + $profileCount profile settings. Restart Edge."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
-    } elseif ($totalSuccess -gt 0) {
-        $statusLabel.Text = "Applied $totalSuccess settings with $errorCount errors. Run as Admin for full access."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 100, 0)
-    } else {
-        $statusLabel.Text = "No settings selected or all operations failed."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 0, 0)
+    finally {
+        Remove-VhdxParametersBuffer -Ptr $paramsPtr
     }
-})
+}
 
-# Reset All Settings
-$btnReset.Add_Click({
-    $result = [System.Windows.Forms.MessageBox]::Show(
-        "This will remove all Edge policy customizations.`n`nAre you sure?",
-        "Confirm Reset",
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
+function Mount-RawVHDX {
+    param([Parameter(Mandatory)][IntPtr]$Handle)
+    
+    Write-Host "Attaching VHDX..." -ForegroundColor Cyan
+    
+    $attachParams = New-Object -TypeName VirtDiskApi+ATTACH_VIRTUAL_DISK_PARAMETERS
+    $attachParams.Version = 1
+    
+    $result = [VirtDiskApi]::AttachVirtualDisk(
+        $Handle, 
+        [IntPtr]::Zero, 
+        [VirtDiskApi]::ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 
+        0, 
+        [ref]$attachParams, 
+        [IntPtr]::Zero
     )
     
-    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        $statusLabel.Text = "Removing policies..."
-        $form.Refresh()
+    if ($result -ne 0) {
+        $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+        throw "AttachVirtualDisk failed: $($win32Err.Message)"
+    }
+    
+    $pathSizeBytes = 520
+    $pathBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($pathSizeBytes)
+    
+    try {
+        $result = [VirtDiskApi]::GetVirtualDiskPhysicalPath($Handle, [ref]$pathSizeBytes, $pathBuffer)
+        if ($result -ne 0) {
+            $win32Err = New-Object -TypeName System.ComponentModel.Win32Exception -ArgumentList $result
+            throw "GetVirtualDiskPhysicalPath failed: $($win32Err.Message)"
+        }
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringUni($pathBuffer)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pathBuffer)
+    }
+}
+
+function Dismount-RawVHDX {
+    param([Parameter(Mandatory)][IntPtr]$Handle)
+    
+    if ($Handle -eq [IntPtr]::Zero) { return }
+    
+    Write-Host "Detaching VHDX..." -ForegroundColor Cyan
+    $null = [VirtDiskApi]::DetachVirtualDisk($Handle, 0, 0)
+    $null = [VirtDiskApi]::CloseHandle($Handle)
+}
+
+# ============================================================
+# Disk Initialization and Partitioning
+# ============================================================
+
+function Initialize-BootableVHDX {
+    param(
+        [Parameter(Mandatory)][string]$PhysicalPath,
+        [Parameter(Mandatory)][ValidateSet('UEFI', 'BIOS')][string]$BootMode,
+        [Parameter(Mandatory)][uint64]$WindowsPartitionSize
+    )
+    
+    Write-Host "Initializing disk structure for $BootMode boot..." -ForegroundColor Cyan
+    
+    # Extract disk number from physical path
+    $diskNumber = -1
+    if ($PhysicalPath -match 'PhysicalDrive(\d+)') {
+        $diskNumber = [int]$Matches[1]
+    }
+    else {
+        throw "Could not determine disk number from path: $PhysicalPath"
+    }
+    
+    # Wait for disk to be available
+    $disk = $null
+    for ($retry = 0; $retry -lt 30; $retry++) {
+        Start-Sleep -Milliseconds 500
+        $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
+        if ($disk) { break }
+    }
+    
+    if (-not $disk) { 
+        throw "Could not find disk $diskNumber after waiting" 
+    }
+    
+    Write-Host "  Disk $diskNumber found: $(Format-Size $disk.Size)" -ForegroundColor DarkGray
+    
+    if ($BootMode -eq 'UEFI') {
+        Write-Host "  Initializing as GPT..." -ForegroundColor DarkGray
+        Initialize-Disk -Number $diskNumber -PartitionStyle GPT -ErrorAction Stop
+        Start-Sleep -Seconds 2
         
-        try {
-            if ($isAdmin -and (Test-Path $EdgePolicyPathHKLM)) {
-                Remove-Item -Path $EdgePolicyPathHKLM -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            if (Test-Path $EdgePolicyPathHKCU) {
-                Remove-Item -Path $EdgePolicyPathHKCU -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            
-            foreach ($cb in (Get-AllCheckboxes)) {
-                $cb.Checked = $false
-            }
-            
-            $statusLabel.Text = "All policies removed. Restart Edge to restore default behavior."
-            $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
-        } catch {
-            $statusLabel.Text = "Error resetting policies: " + $_.Exception.Message
-            $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 0, 0)
+        Write-Host "  Creating EFI System Partition (260 MB)..." -ForegroundColor DarkGray
+        $espPartition = New-Partition -DiskNumber $diskNumber -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+        $null = Format-Volume -Partition $espPartition -FileSystem FAT32 -NewFileSystemLabel "System" -Confirm:$false
+        
+        Write-Host "  Creating Microsoft Reserved Partition (16 MB)..." -ForegroundColor DarkGray
+        $null = New-Partition -DiskNumber $diskNumber -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
+        
+        Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
+        $winPartition = New-Partition -DiskNumber $diskNumber -UseMaximumSize -GptType '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+        
+        return @{ 
+            DiskNumber       = $diskNumber
+            EspPartition     = $espPartition
+            WindowsPartition = $winPartition
+            BootMode         = 'UEFI' 
         }
     }
-})
+    else {
+        Write-Host "  Initializing as MBR..." -ForegroundColor DarkGray
+        Initialize-Disk -Number $diskNumber -PartitionStyle MBR -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        
+        Write-Host "  Creating System Reserved partition (500 MB)..." -ForegroundColor DarkGray
+        $sysPartition = New-Partition -DiskNumber $diskNumber -Size 500MB -IsActive
+        $null = Format-Volume -Partition $sysPartition -FileSystem NTFS -NewFileSystemLabel "System Reserved" -Confirm:$false
+        
+        Write-Host "  Creating Windows partition..." -ForegroundColor DarkGray
+        $winPartition = New-Partition -DiskNumber $diskNumber -UseMaximumSize
+        
+        return @{ 
+            DiskNumber       = $diskNumber
+            SystemPartition  = $sysPartition
+            WindowsPartition = $winPartition
+            BootMode         = 'BIOS' 
+        }
+    }
+}
 
-# Export button
-$btnExport.Add_Click({
-    $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
-    $saveDialog.Filter = "Registry File (*.reg)|*.reg"
-    $saveDialog.FileName = "EdgePolicies.reg"
+function Install-BootFiles {
+    param(
+        [Parameter(Mandatory)][hashtable]$DiskInfo,
+        [Parameter(Mandatory)][string]$WindowsDriveLetter
+    )
     
-    if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Host "Installing boot files..." -ForegroundColor Cyan
+    
+    $windowsPath = "${WindowsDriveLetter}:\Windows"
+    if (-not (Test-Path -LiteralPath $windowsPath)) {
+        throw "Windows directory not found at $windowsPath"
+    }
+    
+    # Get an available drive letter for the boot partition
+    $bootLetter = Get-AvailableDriveLetter
+    if (-not $bootLetter) { 
+        throw "No available drive letters for boot partition" 
+    }
+    
+    # Determine which partition is the boot partition
+    $bootPartition = $null
+    $firmware = $null
+    
+    if ($DiskInfo.BootMode -eq 'UEFI') {
+        $bootPartition = $DiskInfo.EspPartition
+        $firmware = 'UEFI'
+    }
+    else {
+        $bootPartition = $DiskInfo.SystemPartition
+        $firmware = 'BIOS'
+    }
+    
+    Write-Host "  Assigning drive letter $bootLetter to boot partition..." -ForegroundColor DarkGray
+    $bootPartition | Set-Partition -NewDriveLetter $bootLetter
+    Start-Sleep -Seconds 2
+    
+    try {
+        Write-Host "  Running bcdboot for $firmware..." -ForegroundColor DarkGray
+        $bcdbootArgs = "`"$windowsPath`" /s ${bootLetter}: /f $firmware"
+        $bcdbootOutput = & cmd.exe /c "bcdboot.exe $bcdbootArgs 2>&1"
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "bcdboot failed (exit code $LASTEXITCODE): $bcdbootOutput"
+        }
+        Write-Host "  Boot files installed successfully" -ForegroundColor Green
+    }
+    finally {
+        # Remove the drive letter
+        Write-Host "  Removing boot partition drive letter..." -ForegroundColor DarkGray
+        try { 
+            $bootPartition | Remove-PartitionAccessPath -AccessPath "${bootLetter}:\" -ErrorAction SilentlyContinue 
+        } 
+        catch { }
+    }
+}
+
+# ============================================================
+# Volume Bitmap Functions
+# ============================================================
+
+function Get-NtfsVolumeData {
+    param([Parameter(Mandatory)][string]$DriveLetter)
+    
+    $DriveLetter = $DriveLetter.TrimEnd(':', '\')
+    $volumePath = '\\.\' + $DriveLetter + ':'
+    
+    $handle = [NativeDiskApi]::CreateFile(
+        $volumePath, 
+        [NativeDiskApi]::GENERIC_READ, 
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, 
+        [NativeDiskApi]::OPEN_EXISTING, 
+        0, 
+        [IntPtr]::Zero
+    )
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open volume: $(New-Object System.ComponentModel.Win32Exception $err)"
+    }
+    
+    try {
+        $bufferSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER])
+        $buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bufferSize)
+        
         try {
-            $regContent = "Windows Registry Editor Version 5.00`r`n`r`n"
-            $regContent += "[HKEY_CURRENT_USER\SOFTWARE\Policies\Microsoft\Edge]`r`n"
+            $bytesReturned = [uint32]0
+            $success = [NativeDiskApi]::DeviceIoControl(
+                $handle, 
+                [NativeDiskApi]::FSCTL_GET_NTFS_VOLUME_DATA,
+                [IntPtr]::Zero, 
+                0, 
+                $buffer, 
+                [uint32]$bufferSize, 
+                [ref]$bytesReturned, 
+                [IntPtr]::Zero
+            )
             
-            if (Test-Path $EdgePolicyPathHKCU) {
-                $props = Get-ItemProperty -Path $EdgePolicyPathHKCU
-                foreach ($prop in $props.PSObject.Properties) {
-                    if ($prop.Name -notmatch '^PS') {
-                        if ($prop.Value -is [int]) {
-                            $regContent += "`"$($prop.Name)`"=dword:$($prop.Value.ToString('x8'))`r`n"
-                        } elseif ($prop.Value -is [string]) {
-                            $escaped = $prop.Value -replace '\\', '\\' -replace '"', '\"'
-                            $regContent += "`"$($prop.Name)`"=`"$escaped`"`r`n"
+            if (-not $success) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "FSCTL_GET_NTFS_VOLUME_DATA failed: $(New-Object System.ComponentModel.Win32Exception $err)"
+            }
+            
+            $volumeData = [System.Runtime.InteropServices.Marshal]::PtrToStructure(
+                $buffer, 
+                [type][NativeDiskApi+NTFS_VOLUME_DATA_BUFFER]
+            )
+            
+            return @{
+                TotalClusters   = $volumeData.TotalClusters
+                FreeClusters    = $volumeData.FreeClusters
+                BytesPerCluster = $volumeData.BytesPerCluster
+                BytesPerSector  = $volumeData.BytesPerSector
+            }
+        }
+        finally { 
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) 
+        }
+    }
+    finally { 
+        $handle.Close() 
+    }
+}
+
+function Get-VolumeBitmap {
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][long]$TotalClusters
+    )
+    
+    Write-Host "Reading volume allocation bitmap..." -ForegroundColor Cyan
+    
+    $DriveLetter = $DriveLetter.TrimEnd(':', '\')
+    $volumePath = '\\.\' + $DriveLetter + ':'
+    
+    $handle = [NativeDiskApi]::CreateFile(
+        $volumePath, 
+        [NativeDiskApi]::GENERIC_READ,
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, 
+        [NativeDiskApi]::OPEN_EXISTING, 
+        0, 
+        [IntPtr]::Zero
+    )
+    
+    if ($handle.IsInvalid) { 
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open volume: $(New-Object System.ComponentModel.Win32Exception $err)"
+    }
+    
+    try {
+        $bitmapBytes = [long][math]::Ceiling($TotalClusters / 8.0)
+        $fullBitmap = New-Object byte[] $bitmapBytes
+        
+        $startingLcn = [long]0
+        $headerSize = 16
+        $chunkSize = 1048576
+        $outputBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($chunkSize)
+        $inputBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        $bitmapOffset = 0
+        
+        try {
+            while ($startingLcn -lt $TotalClusters) {
+                [System.Runtime.InteropServices.Marshal]::WriteInt64($inputBuffer, 0, $startingLcn)
+                
+                $bytesReturned = [uint32]0
+                $success = [NativeDiskApi]::DeviceIoControl(
+                    $handle, 
+                    [NativeDiskApi]::FSCTL_GET_VOLUME_BITMAP,
+                    $inputBuffer, 
+                    8, 
+                    $outputBuffer, 
+                    [uint32]$chunkSize, 
+                    [ref]$bytesReturned, 
+                    [IntPtr]::Zero
+                )
+                
+                if (-not $success) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    # ERROR_MORE_DATA (234) is expected and OK
+                    if ($err -ne 234) { 
+                        throw "FSCTL_GET_VOLUME_BITMAP failed: error $err" 
+                    }
+                }
+                
+                $dataBytes = [int]($bytesReturned - $headerSize)
+                if ($dataBytes -gt 0) {
+                    $copyLen = [math]::Min($dataBytes, $fullBitmap.Length - $bitmapOffset)
+                    if ($copyLen -gt 0) {
+                        [System.Runtime.InteropServices.Marshal]::Copy(
+                            [IntPtr]::Add($outputBuffer, $headerSize), 
+                            $fullBitmap, 
+                            $bitmapOffset, 
+                            $copyLen
+                        )
+                        $bitmapOffset += $copyLen
+                    }
+                }
+                
+                $clustersRead = [long]$dataBytes * 8
+                if ($clustersRead -le 0) { break }
+                $startingLcn += $clustersRead
+                
+                $pct = Get-ClampedPercent -Current $startingLcn -Total $TotalClusters
+                Write-Progress -Activity "Reading Bitmap" -Status "$pct% complete" -PercentComplete $pct
+            }
+            Write-Progress -Activity "Reading Bitmap" -Completed
+        }
+        finally {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($outputBuffer)
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($inputBuffer)
+        }
+        
+        return $fullBitmap
+    }
+    finally { 
+        $handle.Close() 
+    }
+}
+
+function Get-AllocatedRanges {
+    param(
+        [Parameter(Mandatory)][byte[]]$Bitmap,
+        [Parameter(Mandatory)][long]$TotalClusters,
+        [Parameter(Mandatory)][uint32]$BytesPerCluster,
+        [int]$MinRunClusters = 256
+    )
+    
+    Write-Host "Analyzing allocation bitmap..." -ForegroundColor Cyan
+    
+    $ranges = [System.Collections.ArrayList]::new()
+    $currentStart = [long]-1
+    $allocatedClusters = [long]0
+    $progressInterval = [math]::Max(1, [int]($TotalClusters / 100))
+    
+    for ($cluster = [long]0; $cluster -lt $TotalClusters; $cluster++) {
+        $byteIndex = [int][math]::Floor($cluster / 8)
+        $bitIndex = [int]($cluster % 8)
+        $isAllocated = ($Bitmap[$byteIndex] -band (1 -shl $bitIndex)) -ne 0
+        
+        if ($isAllocated) {
+            if ($currentStart -eq -1) { $currentStart = $cluster }
+            $allocatedClusters++
+        }
+        else {
+            if ($currentStart -ne -1) {
+                $null = $ranges.Add([PSCustomObject]@{ 
+                    StartCluster = $currentStart
+                    EndCluster   = $cluster - 1
+                    ClusterCount = $cluster - $currentStart 
+                })
+                $currentStart = -1
+            }
+        }
+        
+        if ($cluster % $progressInterval -eq 0) {
+            $pct = Get-ClampedPercent -Current $cluster -Total $TotalClusters
+            Write-Progress -Activity "Analyzing Bitmap" -Status "$pct% complete" -PercentComplete $pct
+        }
+    }
+    
+    # Handle last range if still open
+    if ($currentStart -ne -1) {
+        $null = $ranges.Add([PSCustomObject]@{ 
+            StartCluster = $currentStart
+            EndCluster   = $TotalClusters - 1
+            ClusterCount = $TotalClusters - $currentStart 
+        })
+    }
+    Write-Progress -Activity "Analyzing Bitmap" -Completed
+    
+    # Merge nearby ranges to reduce I/O operations
+    Write-Host "Merging adjacent ranges (gap threshold: $MinRunClusters clusters)..." -ForegroundColor Cyan
+    $mergedRanges = [System.Collections.ArrayList]::new()
+    $prev = $null
+    
+    foreach ($range in $ranges) {
+        if ($null -eq $prev) { 
+            $prev = $range
+            continue 
+        }
+        
+        $gap = $range.StartCluster - $prev.EndCluster - 1
+        if ($gap -le $MinRunClusters) {
+            # Merge ranges
+            $prev = [PSCustomObject]@{ 
+                StartCluster = $prev.StartCluster
+                EndCluster   = $range.EndCluster
+                ClusterCount = $range.EndCluster - $prev.StartCluster + 1 
+            }
+        }
+        else {
+            $null = $mergedRanges.Add($prev)
+            $prev = $range
+        }
+    }
+    if ($prev) { 
+        $null = $mergedRanges.Add($prev) 
+    }
+    
+    $totalBytes = [long]$TotalClusters * $BytesPerCluster
+    $allocatedBytes = [long]$allocatedClusters * $BytesPerCluster
+    $savingsPercent = [math]::Round((1 - ($allocatedBytes / $totalBytes)) * 100, 1)
+    
+    Write-Host "  Total:     $(Format-Size $totalBytes)" -ForegroundColor DarkGray
+    Write-Host "  Allocated: $(Format-Size $allocatedBytes)" -ForegroundColor DarkGray
+    Write-Host "  Ranges:    $($mergedRanges.Count)" -ForegroundColor DarkGray
+    Write-Host "  Savings:   $savingsPercent% (free space skipped)" -ForegroundColor Green
+    
+    return @{ 
+        Ranges            = $mergedRanges
+        AllocatedClusters = $allocatedClusters
+        AllocatedBytes    = $allocatedBytes 
+    }
+}
+
+# ============================================================
+# Raw Disk I/O Functions
+# ============================================================
+
+function Open-RawDisk {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('Read', 'Write', 'ReadWrite')][string]$Access
+    )
+    
+    $accessFlags = switch ($Access) {
+        'Read'      { [NativeDiskApi]::GENERIC_READ }
+        'Write'     { [NativeDiskApi]::GENERIC_WRITE }
+        'ReadWrite' { [NativeDiskApi]::GENERIC_READ -bor [NativeDiskApi]::GENERIC_WRITE }
+    }
+    
+    $handle = [NativeDiskApi]::CreateFile(
+        $Path, 
+        $accessFlags,
+        ([NativeDiskApi]::FILE_SHARE_READ -bor [NativeDiskApi]::FILE_SHARE_WRITE),
+        [IntPtr]::Zero, 
+        [NativeDiskApi]::OPEN_EXISTING,
+        ([NativeDiskApi]::FILE_FLAG_NO_BUFFERING -bor [NativeDiskApi]::FILE_FLAG_WRITE_THROUGH),
+        [IntPtr]::Zero
+    )
+    
+    if ($handle.IsInvalid) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to open $Path : $(New-Object System.ComponentModel.Win32Exception $err)"
+    }
+    
+    return $handle
+}
+
+# ============================================================
+# Block Copy Functions
+# ============================================================
+
+function Copy-VolumeToPartition {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DiskPath,
+        [Parameter(Mandatory)][long]$PartitionOffset,
+        [Parameter(Mandatory)][uint64]$TotalBytes,
+        [int]$BlockSize = 4194304
+    )
+    
+    Write-Host "Copying $(Format-Size $TotalBytes) to partition (full copy)..." -ForegroundColor Cyan
+    
+    $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
+    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
+    
+    try {
+        $buffer = New-Object byte[] $BlockSize
+        $totalCopied = [uint64]0
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastPct = -1
+        
+        while ($totalCopied -lt $TotalBytes) {
+            $remainingBytes = $TotalBytes - $totalCopied
+            $bytesToProcess = [math]::Min([uint64]$BlockSize, $remainingBytes)
+            $alignedBytes = [uint32]([math]::Ceiling($bytesToProcess / 4096) * 4096)
+            
+            # Read from source
+            $bytesRead = [uint32]0
+            $readSuccess = [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $alignedBytes, [ref]$bytesRead, [IntPtr]::Zero)
+            if (-not $readSuccess) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "Read failed at offset $totalCopied (Error: $err)"
+            }
+            if ($bytesRead -eq 0) { break }
+            
+            # Seek to destination offset
+            $destOffset = $PartitionOffset + $totalCopied
+            $newPos = [long]0
+            $seekSuccess = [NativeDiskApi]::SetFilePointerEx($destHandle, $destOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN)
+            if (-not $seekSuccess) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "Seek failed at offset $destOffset (Error: $err)"
+            }
+            
+            # Write to destination
+            $toWrite = [math]::Min($bytesRead, $remainingBytes)
+            $alignedWrite = [uint32]([math]::Ceiling($toWrite / 4096) * 4096)
+            
+            $bytesWritten = [uint32]0
+            $writeSuccess = [NativeDiskApi]::WriteFile($destHandle, $buffer, $alignedWrite, [ref]$bytesWritten, [IntPtr]::Zero)
+            if (-not $writeSuccess) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "Write failed at offset $destOffset (Error: $err)"
+            }
+            
+            $totalCopied += $toWrite
+            
+            # Update progress
+            $pct = Get-ClampedPercent -Current $totalCopied -Total $TotalBytes
+            if ($pct -gt $lastPct) {
+                $elapsed = $stopwatch.Elapsed.TotalSeconds
+                $speed = 0
+                $eta = 0
+                if ($elapsed -gt 0) {
+                    $speed = $totalCopied / $elapsed / 1MB
+                    if ($speed -gt 0) {
+                        $eta = ($TotalBytes - $totalCopied) / 1MB / $speed / 60
+                    }
+                }
+                $status = "$pct% - $([math]::Round($speed, 1)) MB/s - ETA: $([math]::Round($eta, 1)) min"
+                Write-Progress -Activity "Copying Data" -Status $status -PercentComplete $pct
+                $lastPct = $pct
+            }
+        }
+        
+        $stopwatch.Stop()
+        Write-Progress -Activity "Copying Data" -Completed
+        
+        $elapsed = $stopwatch.Elapsed.TotalSeconds
+        $avgSpeed = 0
+        if ($elapsed -gt 0) {
+            $avgSpeed = $totalCopied / $elapsed / 1MB
+        }
+        Write-Host "Copied $(Format-Size $totalCopied) in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
+    }
+    finally {
+        if ($sourceHandle -and -not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if ($destHandle -and -not $destHandle.IsClosed) { $destHandle.Close() }
+    }
+}
+
+function Copy-AllocatedBlocksToPartition {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DiskPath,
+        [Parameter(Mandatory)][long]$PartitionOffset,
+        [Parameter(Mandatory)][System.Collections.ArrayList]$Ranges,
+        [Parameter(Mandatory)][uint32]$BytesPerCluster,
+        [Parameter(Mandatory)][long]$AllocatedBytes,
+        [int]$BlockSize = 4194304
+    )
+    
+    # Align block size to cluster size
+    if ($BlockSize % $BytesPerCluster -ne 0) {
+        $BlockSize = [int]([math]::Ceiling($BlockSize / $BytesPerCluster) * $BytesPerCluster)
+    }
+    $clustersPerBlock = [long]($BlockSize / $BytesPerCluster)
+    
+    Write-Host "Copying $(Format-Size $AllocatedBytes) of allocated data (smart copy)..." -ForegroundColor Cyan
+    Write-Host "  Block size: $($BlockSize / 1MB) MB" -ForegroundColor DarkGray
+    
+    $sourceHandle = Open-RawDisk -Path $SourcePath -Access Read
+    $destHandle = Open-RawDisk -Path $DiskPath -Access Write
+    
+    try {
+        $buffer = New-Object byte[] $BlockSize
+        $totalCopied = [long]0
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastPct = -1
+        
+        foreach ($range in $Ranges) {
+            $clusterOffset = [long]$range.StartCluster
+            $clustersRemaining = [long]$range.ClusterCount
+            
+            while ($clustersRemaining -gt 0) {
+                $clustersToRead = [math]::Min($clustersPerBlock, $clustersRemaining)
+                $bytesToRead = [uint32]($clustersToRead * $BytesPerCluster)
+                $sourceByteOffset = [long]$clusterOffset * $BytesPerCluster
+                
+                # Seek source
+                $newPos = [long]0
+                $seekSuccess = [NativeDiskApi]::SetFilePointerEx($sourceHandle, $sourceByteOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN)
+                if (-not $seekSuccess) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Source seek failed at offset $sourceByteOffset (Error: $err)"
+                }
+                
+                # Read
+                $bytesRead = [uint32]0
+                $readSuccess = [NativeDiskApi]::ReadFile($sourceHandle, $buffer, $bytesToRead, [ref]$bytesRead, [IntPtr]::Zero)
+                if (-not $readSuccess) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Read failed at cluster $clusterOffset (Error: $err)"
+                }
+                
+                # Seek destination
+                $destByteOffset = $PartitionOffset + $sourceByteOffset
+                $seekSuccess = [NativeDiskApi]::SetFilePointerEx($destHandle, $destByteOffset, [ref]$newPos, [NativeDiskApi]::FILE_BEGIN)
+                if (-not $seekSuccess) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Dest seek failed at offset $destByteOffset (Error: $err)"
+                }
+                
+                # Write
+                $bytesWritten = [uint32]0
+                $writeSuccess = [NativeDiskApi]::WriteFile($destHandle, $buffer, $bytesRead, [ref]$bytesWritten, [IntPtr]::Zero)
+                if (-not $writeSuccess) {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "Write failed at cluster $clusterOffset (Error: $err)"
+                }
+                
+                $totalCopied += $bytesRead
+                $clusterOffset += $clustersToRead
+                $clustersRemaining -= $clustersToRead
+                
+                # Update progress
+                $pct = Get-ClampedPercent -Current $totalCopied -Total $AllocatedBytes
+                if ($pct -gt $lastPct) {
+                    $elapsed = $stopwatch.Elapsed.TotalSeconds
+                    $speed = 0
+                    $eta = 0
+                    if ($elapsed -gt 0) {
+                        $speed = $totalCopied / $elapsed / 1MB
+                        if ($speed -gt 0) {
+                            $eta = ($AllocatedBytes - $totalCopied) / 1MB / $speed / 60
+                        }
+                    }
+                    $status = "$pct% - $([math]::Round($speed, 1)) MB/s - ETA: $([math]::Round($eta, 1)) min"
+                    Write-Progress -Activity "Copying Allocated Data" -Status $status -PercentComplete $pct
+                    $lastPct = $pct
+                }
+            }
+        }
+        
+        $stopwatch.Stop()
+        Write-Progress -Activity "Copying Allocated Data" -Completed
+        
+        $elapsed = $stopwatch.Elapsed.TotalSeconds
+        $avgSpeed = 0
+        if ($elapsed -gt 0) {
+            $avgSpeed = $totalCopied / $elapsed / 1MB
+        }
+        Write-Host "Copied $(Format-Size $totalCopied) in $([math]::Round($stopwatch.Elapsed.TotalMinutes, 1)) min ($([math]::Round($avgSpeed, 1)) MB/s)" -ForegroundColor Green
+    }
+    finally {
+        if ($sourceHandle -and -not $sourceHandle.IsClosed) { $sourceHandle.Close() }
+        if ($destHandle -and -not $destHandle.IsClosed) { $destHandle.Close() }
+    }
+}
+
+# ============================================================
+# Main Clone Function
+# ============================================================
+
+function New-BootableVolumeClone {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourceVolume,
+        [Parameter(Mandatory)][string]$DestinationVHDX,
+        [ValidateSet('UEFI', 'BIOS')][string]$BootMode = 'UEFI',
+        [switch]$FullCopy,
+        [switch]$FixedSizeVHDX,
+        [switch]$SkipBootFix,
+        [int]$BlockSizeMB = 4
+    )
+    
+    $vhdHandle = [IntPtr]::Zero
+    $snapshot = $null
+    $windowsDriveLetter = $null
+    $diskInfo = $null
+    
+    try {
+        # Parse and validate source volume
+        $driveLetter = $SourceVolume.TrimEnd(':', '\').ToUpper()
+        $partition = Get-Partition -DriveLetter $driveLetter -ErrorAction Stop
+        $partitionSize = $partition.Size
+        $volume = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
+        
+        # Check filesystem
+        if ($volume.FileSystemType -ne 'NTFS' -and -not $FullCopy) {
+            Write-Warning "Volume is $($volume.FileSystemType), not NTFS. Forcing full copy mode."
+            $FullCopy = $true
+        }
+        
+        # Calculate VHDX size
+        $bootPartitionSize = if ($BootMode -eq 'UEFI') { 300MB } else { 550MB }
+        $vhdxSize = [uint64]($partitionSize + $bootPartitionSize + 100MB)
+        $vhdxSize = [uint64]([math]::Ceiling($vhdxSize / 1MB) * 1MB)
+        
+        # Display summary
+        Write-Host ""
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+        Write-Host "                    BOOTABLE VOLUME CLONE                       " -ForegroundColor Yellow
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Source:         ${driveLetter}:" -ForegroundColor White
+        Write-Host "  Destination:    $DestinationVHDX" -ForegroundColor White
+        Write-Host "  Partition Size: $(Format-Size $partitionSize)" -ForegroundColor White
+        Write-Host "  VHDX Size:      $(Format-Size $vhdxSize)" -ForegroundColor White
+        Write-Host "  Boot Mode:      $BootMode" -ForegroundColor White
+        Write-Host "  Copy Mode:      $(if ($FullCopy) { 'Full (all sectors)' } else { 'Smart (skip free space)' })" -ForegroundColor White
+        Write-Host "  VHDX Type:      $(if ($FixedSizeVHDX) { 'Fixed' } else { 'Dynamic' })" -ForegroundColor White
+        Write-Host ""
+        
+        # Get NTFS data if doing smart copy
+        $volumeData = $null
+        if (-not $FullCopy) {
+            $volumeData = Get-NtfsVolumeData -DriveLetter $driveLetter
+            $usedBytes = ($volumeData.TotalClusters - $volumeData.FreeClusters) * $volumeData.BytesPerCluster
+            $freeBytes = $volumeData.FreeClusters * $volumeData.BytesPerCluster
+            Write-Host "  Used space:     $(Format-Size $usedBytes)" -ForegroundColor DarkGray
+            Write-Host "  Free space:     $(Format-Size $freeBytes) (will be skipped)" -ForegroundColor DarkGray
+            Write-Host ""
+        }
+        
+        # Create VSS Snapshot
+        $snapshot = New-VssSnapshot -Volume "${driveLetter}:\"
+        Write-Host "Snapshot created: $($snapshot.DeviceObject)" -ForegroundColor Green
+        Write-Host ""
+        
+        # Create VHDX
+        $vhdHandle = New-RawVHDX -Path $DestinationVHDX -SizeBytes $vhdxSize -FixedSize:$FixedSizeVHDX
+        
+        # Attach VHDX
+        $physicalPath = Mount-RawVHDX -Handle $vhdHandle
+        Write-Host "VHDX attached at: $physicalPath" -ForegroundColor Green
+        Write-Host ""
+        
+        Start-Sleep -Seconds 3
+        
+        # Initialize disk with boot partitions
+        $diskInfo = Initialize-BootableVHDX -PhysicalPath $physicalPath -BootMode $BootMode -WindowsPartitionSize $partitionSize
+        
+        Start-Sleep -Seconds 2
+        
+        # Get Windows partition info
+        $winPartition = $diskInfo.WindowsPartition
+        $winPartitionOffset = $winPartition.Offset
+        $diskPath = "\\.\PhysicalDrive$($diskInfo.DiskNumber)"
+        
+        Write-Host ""
+        Write-Host "Windows partition offset: $winPartitionOffset bytes" -ForegroundColor DarkGray
+        Write-Host "Windows partition size: $(Format-Size $winPartition.Size)" -ForegroundColor DarkGray
+        Write-Host ""
+        
+        $blockSizeBytes = $BlockSizeMB * 1MB
+        
+        # Copy data
+        if ($FullCopy) {
+            Copy-VolumeToPartition `
+                -SourcePath $snapshot.DeviceObject `
+                -DiskPath $diskPath `
+                -PartitionOffset $winPartitionOffset `
+                -TotalBytes $partitionSize `
+                -BlockSize $blockSizeBytes
+        }
+        else {
+            $bitmap = Get-VolumeBitmap -DriveLetter $driveLetter -TotalClusters $volumeData.TotalClusters
+            
+            $allocation = Get-AllocatedRanges `
+                -Bitmap $bitmap `
+                -TotalClusters $volumeData.TotalClusters `
+                -BytesPerCluster $volumeData.BytesPerCluster `
+                -MinRunClusters 256
+            
+            Write-Host ""
+            
+            Copy-AllocatedBlocksToPartition `
+                -SourcePath $snapshot.DeviceObject `
+                -DiskPath $diskPath `
+                -PartitionOffset $winPartitionOffset `
+                -Ranges $allocation.Ranges `
+                -BytesPerCluster $volumeData.BytesPerCluster `
+                -AllocatedBytes $allocation.AllocatedBytes `
+                -BlockSize $blockSizeBytes
+        }
+        
+        # Install boot files
+        if (-not $SkipBootFix) {
+            $windowsDriveLetter = Get-AvailableDriveLetter
+            if (-not $windowsDriveLetter) { 
+                throw "No available drive letters for Windows partition" 
+            }
+            
+            Write-Host ""
+            Write-Host "Assigning drive letter $windowsDriveLetter to Windows partition..." -ForegroundColor Cyan
+            $winPartition | Set-Partition -NewDriveLetter $windowsDriveLetter
+            Start-Sleep -Seconds 2
+            
+            Install-BootFiles -DiskInfo $diskInfo -WindowsDriveLetter $windowsDriveLetter
+            
+            Write-Host "Removing Windows partition drive letter..." -ForegroundColor Cyan
+            try { 
+                $winPartition | Remove-PartitionAccessPath -AccessPath "${windowsDriveLetter}:\" -ErrorAction SilentlyContinue 
+            } 
+            catch { }
+            $windowsDriveLetter = $null
+        }
+        
+        Write-Host ""
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
+        Write-Host "                  BOOTABLE CLONE COMPLETE                       " -ForegroundColor Green
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  VHDX File: $DestinationVHDX" -ForegroundColor White
+        
+        $vhdxFile = Get-Item -LiteralPath $DestinationVHDX
+        Write-Host "  File Size: $(Format-Size $vhdxFile.Length)" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Usage:" -ForegroundColor Cyan
+        Write-Host "    Hyper-V:     Create a new VM and attach this VHDX as the primary disk" -ForegroundColor Gray
+        Write-Host "    Native Boot: Use bcdedit to add a boot entry (requires Pro/Enterprise)" -ForegroundColor Gray
+        Write-Host ""
+        
+        return $DestinationVHDX
+    }
+    catch {
+        Write-Host ""
+        Write-Host "Clone failed: $_" -ForegroundColor Red
+        Write-Host ""
+        
+        # Cleanup drive letters
+        if ($windowsDriveLetter -and $diskInfo -and $diskInfo.WindowsPartition) {
+            try { 
+                $diskInfo.WindowsPartition | Remove-PartitionAccessPath -AccessPath "${windowsDriveLetter}:\" -ErrorAction SilentlyContinue 
+            } 
+            catch { }
+        }
+        
+        # Cleanup VHDX
+        if ($vhdHandle -ne [IntPtr]::Zero) {
+            try { Dismount-RawVHDX -Handle $vhdHandle } catch { }
+            $vhdHandle = [IntPtr]::Zero
+        }
+        
+        if (Test-Path -LiteralPath $DestinationVHDX -ErrorAction SilentlyContinue) {
+            Write-Host "Cleaning up partial VHDX..." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $DestinationVHDX -Force -ErrorAction SilentlyContinue
+        }
+        
+        throw
+    }
+    finally {
+        if ($vhdHandle -ne [IntPtr]::Zero) { 
+            Dismount-RawVHDX -Handle $vhdHandle 
+        }
+        if ($snapshot) { 
+            Remove-VssSnapshot -ShadowId $snapshot.Id 
+        }
+    }
+}
+
+# ============================================================
+# Interactive Menu Functions
+# ============================================================
+
+function Show-Banner {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║        " -ForegroundColor Cyan -NoNewline
+    Write-Host "BOOTABLE VOLUME CLONE UTILITY" -ForegroundColor Yellow -NoNewline
+    Write-Host "                      ║" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║   Clone a running Windows volume to a bootable VHDX file    ║" -ForegroundColor Cyan
+    Write-Host "  ║   Supports Hyper-V VMs and Native VHD Boot                  ║" -ForegroundColor Cyan
+    Write-Host "  ║                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Get-VolumeList {
+    $vols = @(Get-Volume | Where-Object { 
+        $_.DriveLetter -and 
+        $_.DriveType -eq 'Fixed' -and
+        $_.Size -gt 0
+    } | Sort-Object DriveLetter)
+    
+    return $vols
+}
+
+function Show-VolumeMenu {
+    param([array]$Volumes)
+    
+    Write-Host "  Available Volumes:" -ForegroundColor White
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host ""
+    
+    for ($i = 0; $i -lt $Volumes.Count; $i++) {
+        $vol = $Volumes[$i]
+        $num = $i + 1
+        $sizeGB = [math]::Round($vol.Size / 1GB, 2)
+        $usedGB = [math]::Round(($vol.Size - $vol.SizeRemaining) / 1GB, 2)
+        $usedPct = 0
+        if ($vol.Size -gt 0) {
+            $usedPct = [int][math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100)
+        }
+        $label = if ($vol.FileSystemLabel) { $vol.FileSystemLabel } else { "Local Disk" }
+        
+        # Create progress bar
+        $barLength = 20
+        $filledLen = [int][math]::Min($barLength, [math]::Max(0, [math]::Round(($usedPct / 100) * $barLength)))
+        $emptyLen = $barLength - $filledLen
+        
+        $filled = ""
+        $empty = ""
+        if ($filledLen -gt 0) { $filled = [string]::new([char]0x2588, $filledLen) }
+        if ($emptyLen -gt 0) { $empty = [string]::new([char]0x2591, $emptyLen) }
+        $bar = "[$filled$empty]"
+        
+        Write-Host "    [$num] " -ForegroundColor Yellow -NoNewline
+        Write-Host "$($vol.DriveLetter):" -ForegroundColor White -NoNewline
+        Write-Host " $label" -ForegroundColor Gray
+        Write-Host "        $bar " -ForegroundColor DarkCyan -NoNewline
+        Write-Host "$usedGB GB / $sizeGB GB " -ForegroundColor Gray -NoNewline
+        Write-Host "($($vol.FileSystemType))" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+    
+    Write-Host "    [0] " -ForegroundColor Red -NoNewline
+    Write-Host "Exit" -ForegroundColor Gray
+    Write-Host ""
+}
+
+function Start-InteractiveMode {
+    # Default options
+    $optBootMode = 'UEFI'
+    $optFullCopy = $false
+    $optFixedSizeVHDX = $false
+    $optBlockSizeMB = 4
+    
+    while ($true) {
+        Show-Banner
+        
+        # Get volumes
+        $volumes = Get-VolumeList
+        
+        if ($volumes.Count -eq 0) {
+            Write-Host "  No suitable volumes found!" -ForegroundColor Red
+            Wait-KeyPress
+            return
+        }
+        
+        Show-VolumeMenu -Volumes $volumes
+        
+        # Get volume selection
+        Write-Host "  Select volume to clone (0-$($volumes.Count)): " -ForegroundColor White -NoNewline
+        $selInput = Read-Host
+        
+        # Parse selection
+        $selNum = -1
+        $parseOk = [int]::TryParse($selInput.Trim(), [ref]$selNum)
+        
+        if (-not $parseOk -or $selNum -lt 0 -or $selNum -gt $volumes.Count) {
+            Write-Host "  Invalid selection. Please enter a number from 0 to $($volumes.Count)." -ForegroundColor Red
+            Start-Sleep -Seconds 2
+            continue
+        }
+        
+        if ($selNum -eq 0) { 
+            Write-Host ""
+            Write-Host "  Goodbye!" -ForegroundColor Cyan
+            return 
+        }
+        
+        $volIndex = $selNum - 1
+        $selectedVolume = [string]$volumes[$volIndex].DriveLetter
+        $volumeInfo = $volumes[$volIndex]
+        
+        # Build default destination path
+        $defaultName = "Bootable_${selectedVolume}_$(Get-Date -Format 'yyyyMMdd_HHmmss').vhdx"
+        
+        # Find a destination drive with enough space
+        $destDrives = @(Get-Volume | Where-Object { 
+            $_.DriveLetter -and 
+            [string]$_.DriveLetter -ne $selectedVolume -and 
+            $_.DriveType -eq 'Fixed' -and 
+            $_.SizeRemaining -gt ($volumeInfo.Size + 1GB) 
+        } | Sort-Object SizeRemaining -Descending)
+        
+        $defaultPath = "${selectedVolume}:\VMs\$defaultName"
+        if ($destDrives.Count -gt 0) {
+            $defaultPath = "$([string]$destDrives[0].DriveLetter):\VMs\$defaultName"
+        }
+        
+        # Get destination path
+        Write-Host ""
+        Write-Host "  Destination VHDX path" -ForegroundColor White
+        Write-Host "  Default: $defaultPath" -ForegroundColor DarkGray
+        Write-Host "  (Press Enter to use default): " -ForegroundColor White -NoNewline
+        $destInput = Read-Host
+        
+        $destinationPath = $defaultPath
+        if (-not [string]::IsNullOrWhiteSpace($destInput)) {
+            $destinationPath = $destInput.Trim()
+        }
+        
+        if (-not $destinationPath.ToLower().EndsWith('.vhdx')) {
+            $destinationPath = $destinationPath + '.vhdx'
+        }
+        
+        # Options menu
+        $exitOptions = $false
+        while (-not $exitOptions) {
+            Show-Banner
+            
+            $volumeLabel = if ($volumeInfo.FileSystemLabel) { $volumeInfo.FileSystemLabel } else { "Local Disk" }
+            
+            Write-Host "  Source: ${selectedVolume}: ($volumeLabel)" -ForegroundColor White
+            Write-Host "  Destination: $destinationPath" -ForegroundColor White
+            Write-Host ""
+            Write-Host "  Options:" -ForegroundColor White
+            Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host ""
+            
+            $bootColor = if ($optBootMode -eq 'UEFI') { 'Green' } else { 'White' }
+            Write-Host "    [1] Boot Mode:     " -ForegroundColor Yellow -NoNewline
+            Write-Host "$optBootMode" -ForegroundColor $bootColor
+            
+            $copyText = if ($optFullCopy) { 'Full (all sectors)' } else { 'Smart (skip free space)' }
+            $copyColor = if ($optFullCopy) { 'White' } else { 'Green' }
+            Write-Host "    [2] Copy Mode:     " -ForegroundColor Yellow -NoNewline
+            Write-Host "$copyText" -ForegroundColor $copyColor
+            
+            $vhdxText = if ($optFixedSizeVHDX) { 'Fixed' } else { 'Dynamic' }
+            $vhdxColor = if ($optFixedSizeVHDX) { 'White' } else { 'Green' }
+            Write-Host "    [3] VHDX Type:     " -ForegroundColor Yellow -NoNewline
+            Write-Host "$vhdxText" -ForegroundColor $vhdxColor
+            
+            Write-Host "    [4] Block Size:    " -ForegroundColor Yellow -NoNewline
+            Write-Host "$optBlockSizeMB MB" -ForegroundColor White
+            
+            Write-Host ""
+            Write-Host "    [S] Start Clone" -ForegroundColor Green
+            Write-Host "    [C] Change Destination Path" -ForegroundColor Cyan
+            Write-Host "    [B] Back to Volume Selection" -ForegroundColor DarkYellow
+            Write-Host "    [Q] Quit" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  Enter choice: " -ForegroundColor White -NoNewline
+            
+            $choiceInput = Read-Host
+            $choice = $choiceInput.Trim().ToUpper()
+            
+            switch ($choice) {
+                '1' { 
+                    if ($optBootMode -eq 'UEFI') { $optBootMode = 'BIOS' } 
+                    else { $optBootMode = 'UEFI' }
+                }
+                '2' { 
+                    $optFullCopy = -not $optFullCopy 
+                }
+                '3' { 
+                    $optFixedSizeVHDX = -not $optFixedSizeVHDX 
+                }
+                '4' {
+                    Write-Host ""
+                    Write-Host "  Enter block size in MB (1-64) [$optBlockSizeMB]: " -ForegroundColor White -NoNewline
+                    $bsInput = Read-Host
+                    
+                    $bsNum = 0
+                    if ([int]::TryParse($bsInput.Trim(), [ref]$bsNum)) {
+                        if ($bsNum -ge 1 -and $bsNum -le 64) {
+                            $optBlockSizeMB = $bsNum
+                        }
+                        else {
+                            Write-Host "  Value must be between 1 and 64. Keeping current: $optBlockSizeMB MB" -ForegroundColor Yellow
+                            Start-Sleep -Seconds 1
                         }
                     }
                 }
+                'C' {
+                    Write-Host ""
+                    Write-Host "  Enter new destination path [$destinationPath]: " -ForegroundColor White -NoNewline
+                    $newPath = Read-Host
+                    
+                    if (-not [string]::IsNullOrWhiteSpace($newPath)) {
+                        $destinationPath = $newPath.Trim()
+                        if (-not $destinationPath.ToLower().EndsWith('.vhdx')) {
+                            $destinationPath = $destinationPath + '.vhdx'
+                        }
+                    }
+                }
+                'B' { 
+                    $exitOptions = $true
+                }
+                'Q' { 
+                    Write-Host ""
+                    Write-Host "  Goodbye!" -ForegroundColor Cyan
+                    return 
+                }
+                '0' { 
+                    Write-Host ""
+                    Write-Host "  Goodbye!" -ForegroundColor Cyan
+                    return 
+                }
+                'S' {
+                    # Check if destination exists
+                    if (Test-Path -LiteralPath $destinationPath) {
+                        Write-Host ""
+                        Write-Host "  Destination file exists. Overwrite? (y/N): " -ForegroundColor Yellow -NoNewline
+                        $overwriteInput = Read-Host
+                        
+                        if ($overwriteInput.Trim().ToLower() -ne 'y') {
+                            continue
+                        }
+                        Remove-Item -LiteralPath $destinationPath -Force
+                    }
+                    
+                    # Confirm start
+                    Write-Host ""
+                    Write-Host "  Start bootable clone? (Y/n): " -ForegroundColor White -NoNewline
+                    $confirmInput = Read-Host
+                    
+                    if ($confirmInput.Trim().ToLower() -eq 'n') {
+                        continue
+                    }
+                    
+                    # Do the clone
+                    Write-Host ""
+                    try {
+                        New-BootableVolumeClone `
+                            -SourceVolume $selectedVolume `
+                            -DestinationVHDX $destinationPath `
+                            -BootMode $optBootMode `
+                            -FullCopy:$optFullCopy `
+                            -FixedSizeVHDX:$optFixedSizeVHDX `
+                            -BlockSizeMB $optBlockSizeMB
+                        
+                        Write-Host "  Clone completed successfully!" -ForegroundColor Green
+                    }
+                    catch { 
+                        Write-Host ""
+                        Write-Host "  ════════════════════════════════════════════════════════════" -ForegroundColor Red
+                        Write-Host "  Clone failed: $_" -ForegroundColor Red
+                        Write-Host "  ════════════════════════════════════════════════════════════" -ForegroundColor Red
+                    }
+                    
+                    Write-Host ""
+                    Wait-KeyPress
+                    
+                    # Ask to clone another
+                    Write-Host ""
+                    Write-Host "  Clone another volume? (y/N): " -ForegroundColor White -NoNewline
+                    $anotherInput = Read-Host
+                    
+                    if ($anotherInput.Trim().ToLower() -ne 'y') { 
+                        Write-Host ""
+                        Write-Host "  Goodbye!" -ForegroundColor Cyan
+                        return 
+                    }
+                    
+                    $exitOptions = $true
+                }
+                default {
+                    # Invalid input - just redraw the menu
+                }
             }
-            
-            [System.IO.File]::WriteAllText($saveDialog.FileName, $regContent, [System.Text.Encoding]::Unicode)
-            $statusLabel.Text = "Exported to: $($saveDialog.FileName)"
-            $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
-        } catch {
-            $statusLabel.Text = "Export failed: " + $_.Exception.Message
-            $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 0, 0)
-        }
-    }
-})
-
-$btnExit.Add_Click({
-    $form.Close()
-})
-
-# Load current settings on startup
-function Load-CurrentSettings {
-    $checkStates = @{
-        $chkHideFirstRun = (Get-EdgePolicy "HideFirstRunExperience") -eq 1
-        $chkDisableTelemetry = (Get-EdgePolicy "MetricsReportingEnabled") -eq 0
-        $chkDisablePersonalization = (Get-EdgePolicy "PersonalizationReportingEnabled") -eq 0
-        $chkDisableSync = (Get-EdgePolicy "SyncDisabled") -eq 1
-        $chkDisableShopping = (Get-EdgePolicy "EdgeShoppingAssistantEnabled") -eq 0
-        $chkBlankHomepage = (Get-EdgePolicy "HomepageLocation") -eq "about:blank"
-        $chkBlankNewTab = (Get-EdgePolicy "NewTabPageLocation") -eq "about:blank"
-        $chkDisableSidebar = (Get-EdgePolicy "HubsSidebarEnabled") -eq 0
-        $chkDisableTranslate = (Get-EdgePolicy "TranslateEnabled") -eq 0
-    }
-    
-    foreach ($cb in $checkStates.Keys) {
-        if ($checkStates[$cb]) {
-            $cb.Checked = $true
         }
     }
 }
 
-Load-CurrentSettings
+# ============================================================
+# Entry Point
+# ============================================================
 
-[void]$form.ShowDialog()
+$runInteractive = $false
+
+if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
+    $runInteractive = $true
+}
+elseif ([string]::IsNullOrWhiteSpace($SourceVolume) -and [string]::IsNullOrWhiteSpace($DestinationVHDX)) {
+    $runInteractive = $true
+}
+
+if ($runInteractive) {
+    Start-InteractiveMode
+}
+else {
+    if ([string]::IsNullOrWhiteSpace($SourceVolume)) {
+        throw "SourceVolume is required. Run without parameters for interactive mode."
+    }
+    if ([string]::IsNullOrWhiteSpace($DestinationVHDX)) {
+        throw "DestinationVHDX is required. Run without parameters for interactive mode."
+    }
+    
+    New-BootableVolumeClone `
+        -SourceVolume $SourceVolume `
+        -DestinationVHDX $DestinationVHDX `
+        -BootMode $BootMode `
+        -FullCopy:$FullCopy `
+        -FixedSizeVHDX:$FixedSizeVHDX `
+        -SkipBootFix:$SkipBootFix `
+        -BlockSizeMB $BlockSizeMB
+}
