@@ -1,5 +1,7 @@
 # 🔒 Lockdown Windows
 
+WARNING - IN DEV - USE AT OWN RISK !!!!
+
 A collection of PowerShell scripts designed to harden Windows devices by configuring security features such as Windows Defender, Windows Firewall, network settings, and Windows Defender Application Control (WDAC).
 
 ## 📋 Overview
